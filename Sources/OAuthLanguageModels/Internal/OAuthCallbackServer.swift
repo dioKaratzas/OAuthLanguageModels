@@ -67,8 +67,9 @@ actor OAuthCallbackServer {
         if let result { return try result.get() }
         return try await withThrowingTaskGroup(of: String.self) { group in
             group.addTask { [weak self] in
-                try await withCheckedThrowingContinuation { cont in
-                    Task { await self?.register(continuation: cont) }
+                guard let self else { throw OAuthCallbackError.serverError("Server deallocated.") }
+                return try await withCheckedThrowingContinuation { cont in
+                    Task { await self.register(continuation: cont) }
                 }
             }
             group.addTask {

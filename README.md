@@ -23,7 +23,7 @@ Two pieces, used independently:
 )
 ```
 
-Requires Swift 6.3+, macOS 14, iOS 17, tvOS 17, watchOS 10, visionOS 1, or Mac Catalyst 17.
+Requires Swift 6.1+, macOS 14, iOS 17, tvOS 17, watchOS 10, visionOS 1, or Mac Catalyst 17.
 
 ## Using the language models
 
