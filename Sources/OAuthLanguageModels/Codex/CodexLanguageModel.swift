@@ -151,6 +151,18 @@ public struct CodexLanguageModel: LanguageModel {
         return LanguageModelSession.ResponseStream(stream: stream)
     }
 
+    // MARK: Fileprivate
+
+    /// Top-level request keys callers may not override via
+    /// `CustomGenerationOptions.extraBody`. These either define the
+    /// OAuth/Codex request shape, are required for cross-call cache
+    /// stability (`prompt_cache_key`), or are required for reasoning
+    /// replay correctness (`include`).
+    fileprivate static let reservedBodyKeys: Set<String> = [
+        "model", "input", "instructions", "tools",
+        "prompt_cache_key", "store", "stream", "include"
+    ]
+
     // MARK: Private
 
     private static var userAgent: String {
@@ -244,16 +256,6 @@ public struct CodexLanguageModel: LanguageModel {
         let parameters = try? providerToolSchemaJSONValue(for: tool.parameters)
         return OpenResponsesTool(name: tool.name, description: tool.description, parameters: parameters)
     }
-
-    /// Top-level request keys callers may not override via
-    /// `CustomGenerationOptions.extraBody`. These either define the
-    /// OAuth/Codex request shape, are required for cross-call cache
-    /// stability (`prompt_cache_key`), or are required for reasoning
-    /// replay correctness (`include`).
-    fileprivate static let reservedBodyKeys: Set<String> = [
-        "model", "input", "instructions", "tools",
-        "prompt_cache_key", "store", "stream", "include"
-    ]
 
     private static func makeRequestBody(
         model: String,
@@ -490,6 +492,22 @@ public struct CodexLanguageModel: LanguageModel {
         }
     }
 
+    /// Pull `reasoning` items out of the final response output array, in
+    /// their original order. These are passed back verbatim in the next
+    /// request's `input` so the model retains its chain of thought when
+    /// `store: false`.
+    private static func extractReasoningItems(from output: [JSONValue]?) -> [JSONValue] {
+        guard let output else { return [] }
+        return output.compactMap { item in
+            guard case let .object(object) = item,
+                  case let .string(type)? = object["type"],
+                  type == "reasoning" else {
+                return nil
+            }
+            return item
+        }
+    }
+
     private func send(
         inputs: [JSONValue],
         instructions: String?,
@@ -641,22 +659,6 @@ public struct CodexLanguageModel: LanguageModel {
             toolCalls: toolCalls,
             reasoningItems: reasoningItems
         )
-    }
-
-    /// Pull `reasoning` items out of the final response output array, in
-    /// their original order. These are passed back verbatim in the next
-    /// request's `input` so the model retains its chain of thought when
-    /// `store: false`.
-    private static func extractReasoningItems(from output: [JSONValue]?) -> [JSONValue] {
-        guard let output else { return [] }
-        return output.compactMap { item in
-            guard case let .object(object) = item,
-                  case let .string(type)? = object["type"],
-                  type == "reasoning" else {
-                return nil
-            }
-            return item
-        }
     }
 
     private func collect(_ bytes: URLSession.AsyncBytes) async throws -> Data {

@@ -1,7 +1,7 @@
 import AnyLanguageModel
 import Foundation
 
-extension CodexLanguageModel {
+public extension CodexLanguageModel {
     /// Per-call options for `CodexLanguageModel`.
     ///
     /// Set via the standard AnyLanguageModel subscript:
@@ -19,21 +19,8 @@ extension CodexLanguageModel {
     /// > (via `prompt_cache_key`). Toggling these between calls in the
     /// > same `LanguageModelSession` will cause a cache miss. Prefer
     /// > setting them once for the duration of a session.
-    public struct CustomGenerationOptions: AnyLanguageModel.CustomGenerationOptions {
-        public var topP: Double?
-        public var parallelToolCalls: Bool?
-        public var maxToolCalls: Int?
-        public var reasoning: ReasoningConfiguration?
-        public var verbosity: Verbosity?
-        public var maxOutputTokens: Int?
-        public var toolChoice: ToolChoice?
-        /// Additional keys to merge into the top-level request body.
-        ///
-        /// Reserved keys (`model`, `input`, `instructions`, `tools`,
-        /// `prompt_cache_key`, `store`, `stream`, `include`) are dropped
-        /// to preserve correctness of the Codex/OAuth request shape and
-        /// the cache contract.
-        public var extraBody: [String: JSONValue]?
+    struct CustomGenerationOptions: AnyLanguageModel.CustomGenerationOptions {
+        // MARK: Lifecycle
 
         public init(
             topP: Double? = nil,
@@ -55,6 +42,8 @@ extension CodexLanguageModel {
             self.extraBody = extraBody
         }
 
+        // MARK: Public
+
         public enum ReasoningEffort: String, Hashable, Sendable {
             case minimal, low, medium, high
         }
@@ -62,17 +51,21 @@ extension CodexLanguageModel {
         /// Configuration for the [reasoning](https://platform.openai.com/docs/guides/reasoning)
         /// behavior of o-series and gpt-5 models.
         public struct ReasoningConfiguration: Hashable, Sendable {
+            // MARK: Lifecycle
+
+            public init(effort: ReasoningEffort? = nil, summary: Summary? = nil) {
+                self.effort = effort
+                self.summary = summary
+            }
+
+            // MARK: Public
+
             public enum Summary: String, Hashable, Sendable {
                 case auto, concise, detailed
             }
 
             public var effort: ReasoningEffort?
             public var summary: Summary?
-
-            public init(effort: ReasoningEffort? = nil, summary: Summary? = nil) {
-                self.effort = effort
-                self.summary = summary
-            }
         }
 
         public enum Verbosity: String, Hashable, Sendable {
@@ -86,9 +79,26 @@ extension CodexLanguageModel {
             case function(name: String)
             case allowedTools(names: [String], mode: AllowedMode)
 
+            // MARK: Public
+
             public enum AllowedMode: String, Hashable, Sendable {
                 case auto, required
             }
         }
+
+        public var topP: Double?
+        public var parallelToolCalls: Bool?
+        public var maxToolCalls: Int?
+        public var reasoning: ReasoningConfiguration?
+        public var verbosity: Verbosity?
+        public var maxOutputTokens: Int?
+        public var toolChoice: ToolChoice?
+        /// Additional keys to merge into the top-level request body.
+        ///
+        /// Reserved keys (`model`, `input`, `instructions`, `tools`,
+        /// `prompt_cache_key`, `store`, `stream`, `include`) are dropped
+        /// to preserve correctness of the Codex/OAuth request shape and
+        /// the cache contract.
+        public var extraBody: [String: JSONValue]?
     }
 }

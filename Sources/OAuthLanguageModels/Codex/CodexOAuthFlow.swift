@@ -44,11 +44,10 @@ public let defaultCodexOriginator = "OAuthLanguageModels"
 /// button, display a QR code), then `await pending.waitForCallback()` to
 /// receive the resulting `CodexAuth`.
 public struct CodexPendingLogin: Sendable {
+    // MARK: Public
+
     /// The URL the user must visit to authorize the application.
     public let authorizationURL: URL
-
-    let server: OAuthCallbackServer
-    let verifier: String
 
     /// Waits for the loopback callback server to receive the authorization
     /// code, exchanges it for tokens, and returns the resulting auth. The
@@ -65,6 +64,11 @@ public struct CodexPendingLogin: Sendable {
     public func cancel() async {
         await server.stop()
     }
+
+    // MARK: Internal
+
+    let server: OAuthCallbackServer
+    let verifier: String
 }
 
 // MARK: - CodexOAuthFlow
@@ -178,7 +182,7 @@ public enum CodexOAuthFlow {
         guard
             parts.count == 3,
             let payloadData = Data(base64URLEncoded: String(parts[1])),
-            let payload = try? JSONDecoder.snakeCase.decode(CodexJWTPayload.self, from: payloadData),
+            let payload = try? JSONDecoder().decode(CodexJWTPayload.self, from: payloadData),
             let accountID = payload.authClaim?.chatgptAccountID,
             !accountID.isEmpty
         else { return nil }

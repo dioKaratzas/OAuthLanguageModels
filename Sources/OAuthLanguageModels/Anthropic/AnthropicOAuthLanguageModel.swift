@@ -167,6 +167,13 @@ public struct AnthropicOAuthLanguageModel: LanguageModel {
 
     // MARK: Private
 
+    /// Top-level body keys that callers may not override via
+    /// `CustomGenerationOptions.extraBody`. These are required for the
+    /// OAuth/Claude Code request shape to be valid.
+    private static let reservedBodyKeys: Set<String> = [
+        "model", "system", "messages", "tools"
+    ]
+
     private var cacheControl: AnthropicRequest.CacheControl {
         longCacheRetention ? .ephemeralLong : .ephemeral
     }
@@ -264,13 +271,6 @@ public struct AnthropicOAuthLanguageModel: LanguageModel {
         }
         return try JSONEncoder.deterministic.encode(JSONValue.object(object))
     }
-
-    /// Top-level body keys that callers may not override via
-    /// `CustomGenerationOptions.extraBody`. These are required for the
-    /// OAuth/Claude Code request shape to be valid.
-    private static let reservedBodyKeys: Set<String> = [
-        "model", "system", "messages", "tools"
-    ]
 
     private func send(
         messages: [AnthropicRequest.Message],
@@ -408,6 +408,8 @@ private struct AnthropicRequest: Encodable {
         case tool(name: String)
         case disabled
 
+        // MARK: Lifecycle
+
         init(from choice: AnthropicOAuthLanguageModel.CustomGenerationOptions.ToolChoice) {
             switch choice {
             case .auto: self = .auto
@@ -417,7 +419,7 @@ private struct AnthropicRequest: Encodable {
             }
         }
 
-        private enum CodingKeys: String, CodingKey { case type, name }
+        // MARK: Internal
 
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
@@ -430,16 +432,24 @@ private struct AnthropicRequest: Encodable {
             case .disabled: try container.encode("none", forKey: .type)
             }
         }
+
+        // MARK: Private
+
+        private enum CodingKeys: String, CodingKey { case type, name }
     }
 
     struct Thinking: Encodable {
-        let type: String
-        let budgetTokens: Int
+        // MARK: Lifecycle
 
         init(budgetTokens: Int) {
-            self.type = "enabled"
+            type = "enabled"
             self.budgetTokens = budgetTokens
         }
+
+        // MARK: Internal
+
+        let type: String
+        let budgetTokens: Int
     }
 
     let model: String
@@ -529,27 +539,35 @@ private struct AnthropicResponse: Decodable {
     /// requests within the same tool-use turn, otherwise Anthropic
     /// rejects the request.
     struct Thinking: Codable {
-        let type: String
-        let thinking: String
-        let signature: String?
+        // MARK: Lifecycle
 
         init(thinking: String, signature: String?) {
-            self.type = "thinking"
+            type = "thinking"
             self.thinking = thinking
             self.signature = signature
         }
+
+        // MARK: Internal
+
+        let type: String
+        let thinking: String
+        let signature: String?
     }
 
     /// A thinking block whose contents have been redacted by Anthropic's
     /// safety systems. Opaque to clients but must still be replayed.
     struct RedactedThinking: Codable {
-        let type: String
-        let data: String
+        // MARK: Lifecycle
 
         init(data: String) {
-            self.type = "redacted_thinking"
+            type = "redacted_thinking"
             self.data = data
         }
+
+        // MARK: Internal
+
+        let type: String
+        let data: String
     }
 
     struct Text: Codable {

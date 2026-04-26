@@ -1,7 +1,7 @@
 import AnyLanguageModel
 import Foundation
 
-extension AnthropicOAuthLanguageModel {
+public extension AnthropicOAuthLanguageModel {
     /// Per-call options for `AnthropicOAuthLanguageModel`.
     ///
     /// Set via the standard AnyLanguageModel subscript:
@@ -19,18 +19,8 @@ extension AnthropicOAuthLanguageModel {
     /// > Toggling these between calls in the same `LanguageModelSession`
     /// > will cause a cache miss. Prefer setting them once for the
     /// > duration of a session.
-    public struct CustomGenerationOptions: AnyLanguageModel.CustomGenerationOptions {
-        public var topP: Double?
-        public var topK: Int?
-        public var stopSequences: [String]?
-        public var toolChoice: ToolChoice?
-        public var thinking: Thinking?
-        /// Additional keys to merge into the top-level request body.
-        ///
-        /// Reserved keys (`model`, `system`, `messages`, `tools`) are
-        /// dropped to preserve the integrity of the OAuth/Claude Code
-        /// request shape.
-        public var extraBody: [String: JSONValue]?
+    struct CustomGenerationOptions: AnyLanguageModel.CustomGenerationOptions {
+        // MARK: Lifecycle
 
         public init(
             topP: Double? = nil,
@@ -48,6 +38,8 @@ extension AnthropicOAuthLanguageModel {
             self.extraBody = extraBody
         }
 
+        // MARK: Public
+
         public enum ToolChoice: Hashable, Sendable {
             case auto
             case any
@@ -60,17 +52,33 @@ extension AnthropicOAuthLanguageModel {
         /// Enabling thinking forces `temperature` to `1` (Anthropic
         /// requirement) and adds a `thinking` block to the request body.
         public struct Thinking: Hashable, Sendable {
+            // MARK: Lifecycle
+
+            public init(budgetTokens: Int) {
+                type = .enabled
+                self.budgetTokens = budgetTokens
+            }
+
+            // MARK: Public
+
             public enum Mode: String, Sendable {
                 case enabled
             }
 
             public var type: Mode
             public var budgetTokens: Int
-
-            public init(budgetTokens: Int) {
-                self.type = .enabled
-                self.budgetTokens = budgetTokens
-            }
         }
+
+        public var topP: Double?
+        public var topK: Int?
+        public var stopSequences: [String]?
+        public var toolChoice: ToolChoice?
+        public var thinking: Thinking?
+        /// Additional keys to merge into the top-level request body.
+        ///
+        /// Reserved keys (`model`, `system`, `messages`, `tools`) are
+        /// dropped to preserve the integrity of the OAuth/Claude Code
+        /// request shape.
+        public var extraBody: [String: JSONValue]?
     }
 }

@@ -38,12 +38,10 @@ public enum AnthropicOAuthError: LocalizedError, Sendable {
 /// button, display a QR code), then `await pending.waitForCallback()` to
 /// receive the resulting `AnthropicAuth`.
 public struct AnthropicPendingLogin: Sendable {
+    // MARK: Public
+
     /// The URL the user must visit to authorize the application.
     public let authorizationURL: URL
-
-    let server: OAuthCallbackServer
-    let state: String
-    let verifier: String
 
     /// Waits for the loopback callback server to receive the authorization
     /// code, exchanges it for tokens, and returns the resulting auth. The
@@ -64,6 +62,12 @@ public struct AnthropicPendingLogin: Sendable {
     public func cancel() async {
         await server.stop()
     }
+
+    // MARK: Internal
+
+    let server: OAuthCallbackServer
+    let state: String
+    let verifier: String
 }
 
 // MARK: - AnthropicOAuthFlow
