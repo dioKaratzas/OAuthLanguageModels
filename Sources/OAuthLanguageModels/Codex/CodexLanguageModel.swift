@@ -54,12 +54,13 @@ public struct CodexLanguageModel: LanguageModel {
         to _: Prompt,
         generating type: Content.Type,
         includeSchemaInPrompt _: Bool,
-        options _: GenerationOptions
+        options: GenerationOptions
     ) async throws -> LanguageModelSession.Response<Content> {
         guard type == String.self else {
             throw CodexLanguageModelError.unsupportedContentType
         }
 
+        let custom = options[custom: Self.self] ?? .init()
         var inputs = try await buildInputs(from: session.transcript)
         let tools = session.tools.map(Self.convertToolToOpenResponsesFormat)
         var entries: [Transcript.Entry] = []
@@ -68,8 +69,17 @@ public struct CodexLanguageModel: LanguageModel {
             let response = try await send(
                 inputs: inputs,
                 instructions: session.instructions?.description,
-                tools: tools.isEmpty ? nil : tools
+                tools: tools.isEmpty ? nil : tools,
+                options: options,
+                custom: custom
             )
+
+            // Reasoning items appear in `output` ahead of any
+            // `function_call` / `message` items in the same turn. They
+            // must be replayed in subsequent requests within this same
+            // tool-loop so the model retains its chain of thought across
+            // rounds (required because `store: false`).
+            inputs.append(contentsOf: response.reasoningItems)
 
             let toolCalls = response.toolCalls
             if !toolCalls.isEmpty {
@@ -235,13 +245,28 @@ public struct CodexLanguageModel: LanguageModel {
         return OpenResponsesTool(name: tool.name, description: tool.description, parameters: parameters)
     }
 
+    /// Top-level request keys callers may not override via
+    /// `CustomGenerationOptions.extraBody`. These either define the
+    /// OAuth/Codex request shape, are required for cross-call cache
+    /// stability (`prompt_cache_key`), or are required for reasoning
+    /// replay correctness (`include`).
+    fileprivate static let reservedBodyKeys: Set<String> = [
+        "model", "input", "instructions", "tools",
+        "prompt_cache_key", "store", "stream", "include"
+    ]
+
     private static func makeRequestBody(
         model: String,
         instructions: String,
         inputs: [JSONValue],
         tools: [OpenResponsesTool]?,
-        promptCacheKey: String
+        promptCacheKey: String,
+        options: GenerationOptions,
+        custom: CustomGenerationOptions
     ) -> JSONValue {
+        let verbosity = custom.verbosity?.rawValue ?? "medium"
+        let parallel = custom.parallelToolCalls ?? true
+
         var body: [String: JSONValue] = [
             "model": .string(model),
             "instructions": .string(instructions),
@@ -249,17 +274,72 @@ public struct CodexLanguageModel: LanguageModel {
             "prompt_cache_key": .string(promptCacheKey),
             "store": .bool(false),
             "stream": .bool(true),
-            "text": .object(["verbosity": .string("medium")]),
+            "text": .object(["verbosity": .string(verbosity)]),
             "include": .array([.string("reasoning.encrypted_content")]),
-            "tool_choice": .string("auto"),
-            "parallel_tool_calls": .bool(true)
+            "parallel_tool_calls": .bool(parallel)
         ]
 
         if let tools, !tools.isEmpty {
             body["tools"] = .array(tools.map(\.jsonValue))
         }
 
+        // Sampling / generation knobs.
+        if let temperature = options.temperature {
+            body["temperature"] = .double(temperature)
+        }
+        if let topP = custom.topP {
+            body["top_p"] = .double(topP)
+        }
+        if let maxOutput = custom.maxOutputTokens ?? options.maximumResponseTokens {
+            body["max_output_tokens"] = .int(maxOutput)
+        }
+        if let maxToolCalls = custom.maxToolCalls {
+            body["max_tool_calls"] = .int(maxToolCalls)
+        }
+
+        if let reasoning = custom.reasoning {
+            var reasoningObject: [String: JSONValue] = [:]
+            if let effort = reasoning.effort {
+                reasoningObject["effort"] = .string(effort.rawValue)
+            }
+            if let summary = reasoning.summary {
+                reasoningObject["summary"] = .string(summary.rawValue)
+            }
+            if !reasoningObject.isEmpty {
+                body["reasoning"] = .object(reasoningObject)
+            }
+        }
+
+        // Tool choice (defaults to "auto" if unset).
+        body["tool_choice"] = custom.toolChoice.map(toolChoiceJSON) ?? .string("auto")
+
+        // extraBody is merged last and may not override reserved keys.
+        if let extra = custom.extraBody {
+            for (key, value) in extra where !reservedBodyKeys.contains(key) {
+                body[key] = value
+            }
+        }
+
         return .object(body)
+    }
+
+    private static func toolChoiceJSON(_ choice: CustomGenerationOptions.ToolChoice) -> JSONValue {
+        switch choice {
+        case .none: return .string("none")
+        case .auto: return .string("auto")
+        case .required: return .string("required")
+        case let .function(name):
+            return .object(["type": .string("function"), "name": .string(name)])
+        case let .allowedTools(names, mode):
+            let descriptors = names.map { name in
+                JSONValue.object(["type": .string("function"), "name": .string(name)])
+            }
+            return .object([
+                "type": .string("allowed_tools"),
+                "mode": .string(mode.rawValue),
+                "tools": .array(descriptors)
+            ])
+        }
     }
 
     private static func extractToolCalls(from output: [JSONValue]?) throws -> [ProviderToolCall] {
@@ -413,7 +493,9 @@ public struct CodexLanguageModel: LanguageModel {
     private func send(
         inputs: [JSONValue],
         instructions: String?,
-        tools: [OpenResponsesTool]?
+        tools: [OpenResponsesTool]?,
+        options: GenerationOptions,
+        custom: CustomGenerationOptions
     ) async throws -> CodexStreamingResponse {
         let token = try await tokenProvider()
         let url = resolveCodexURL(from: baseURL)
@@ -439,7 +521,9 @@ public struct CodexLanguageModel: LanguageModel {
                 instructions: resolvedInstructions(instructions),
                 inputs: inputs,
                 tools: tools,
-                promptCacheKey: sessionID
+                promptCacheKey: sessionID,
+                options: options,
+                custom: custom
             )
         )
         request.httpBody = requestBody
@@ -550,7 +634,29 @@ public struct CodexLanguageModel: LanguageModel {
 
         let toolCalls = Array(toolCallsByID.values).sorted { $0.id < $1.id }
         let outputText = accumulatedText.isEmpty ? latestOutputText : accumulatedText
-        return CodexStreamingResponse(output: latestOutput, outputText: outputText, toolCalls: toolCalls)
+        let reasoningItems = Self.extractReasoningItems(from: latestOutput)
+        return CodexStreamingResponse(
+            output: latestOutput,
+            outputText: outputText,
+            toolCalls: toolCalls,
+            reasoningItems: reasoningItems
+        )
+    }
+
+    /// Pull `reasoning` items out of the final response output array, in
+    /// their original order. These are passed back verbatim in the next
+    /// request's `input` so the model retains its chain of thought when
+    /// `store: false`.
+    private static func extractReasoningItems(from output: [JSONValue]?) -> [JSONValue] {
+        guard let output else { return [] }
+        return output.compactMap { item in
+            guard case let .object(object) = item,
+                  case let .string(type)? = object["type"],
+                  type == "reasoning" else {
+                return nil
+            }
+            return item
+        }
     }
 
     private func collect(_ bytes: URLSession.AsyncBytes) async throws -> Data {
@@ -611,6 +717,10 @@ private struct CodexStreamingResponse {
     let output: [JSONValue]?
     let outputText: String?
     let toolCalls: [ProviderToolCall]
+    /// Encrypted `reasoning` items emitted by the model in `output`,
+    /// preserved verbatim so the caller can replay them in subsequent
+    /// requests within the same `LanguageModelSession`.
+    let reasoningItems: [JSONValue]
 }
 
 // MARK: - CodexLanguageModelError

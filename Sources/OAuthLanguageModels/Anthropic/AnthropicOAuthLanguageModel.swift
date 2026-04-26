@@ -56,12 +56,13 @@ public struct AnthropicOAuthLanguageModel: LanguageModel {
         to _: Prompt,
         generating type: Content.Type,
         includeSchemaInPrompt _: Bool,
-        options _: GenerationOptions
+        options: GenerationOptions
     ) async throws -> LanguageModelSession.Response<Content> {
         guard type == String.self else {
             throw AnthropicOAuthLanguageModelError.unsupportedContentType
         }
 
+        let custom = options[custom: Self.self] ?? .init()
         var messages = try Self.buildMessages(from: session.transcript)
         let tools = try session.tools.map(Self.convertToolToAnthropicFormat)
         var entries: [Transcript.Entry] = []
@@ -70,7 +71,9 @@ public struct AnthropicOAuthLanguageModel: LanguageModel {
             let payload = try await send(
                 messages: messages,
                 instructions: session.instructions?.description,
-                tools: tools.isEmpty ? nil : tools
+                tools: tools.isEmpty ? nil : tools,
+                options: options,
+                custom: custom
             )
 
             let toolCalls = try payload.content.compactMap { block -> ProviderToolCall? in
@@ -243,10 +246,38 @@ public struct AnthropicOAuthLanguageModel: LanguageModel {
         return object
     }
 
+    /// Encode the request body and merge any caller-supplied `extraBody`
+    /// keys, dropping reserved keys to preserve the OAuth request shape.
+    /// Re-encodes through the deterministic encoder so the final bytes
+    /// have stable key ordering (cache-prefix safety).
+    private static func encodeBody(
+        _ body: AnthropicRequest,
+        mergingExtraBody extra: [String: JSONValue]?
+    ) throws -> Data {
+        let baseData = try JSONEncoder.snakeCase.encode(body)
+        guard let extra, !extra.isEmpty else { return baseData }
+
+        let value = try JSONDecoder().decode(JSONValue.self, from: baseData)
+        guard case var .object(object) = value else { return baseData }
+        for (key, value) in extra where !reservedBodyKeys.contains(key) {
+            object[key] = value
+        }
+        return try JSONEncoder.deterministic.encode(JSONValue.object(object))
+    }
+
+    /// Top-level body keys that callers may not override via
+    /// `CustomGenerationOptions.extraBody`. These are required for the
+    /// OAuth/Claude Code request shape to be valid.
+    private static let reservedBodyKeys: Set<String> = [
+        "model", "system", "messages", "tools"
+    ]
+
     private func send(
         messages: [AnthropicRequest.Message],
         instructions: String?,
-        tools: [AnthropicTool]?
+        tools: [AnthropicTool]?,
+        options: GenerationOptions,
+        custom: CustomGenerationOptions
     ) async throws -> AnthropicResponse {
         let accessToken = try await tokenProvider()
 
@@ -281,14 +312,23 @@ public struct AnthropicOAuthLanguageModel: LanguageModel {
             cachedMessages[cachedMessages.count - 1].markLastBlockCached(with: cacheControl)
         }
 
+        // Anthropic requires temperature == 1 when extended thinking is on.
+        let temperature: Double? = custom.thinking != nil ? 1 : options.temperature
+
         let body = AnthropicRequest(
             model: model,
-            maxTokens: maxTokens,
+            maxTokens: options.maximumResponseTokens ?? maxTokens,
             system: system,
             messages: cachedMessages,
-            tools: tools
+            tools: tools,
+            temperature: temperature,
+            topP: custom.topP,
+            topK: custom.topK,
+            stopSequences: custom.stopSequences,
+            toolChoice: custom.toolChoice.map(AnthropicRequest.ToolChoice.init(from:)),
+            thinking: custom.thinking.map { .init(budgetTokens: $0.budgetTokens) }
         )
-        request.httpBody = try JSONEncoder.snakeCase.encode(body)
+        request.httpBody = try Self.encodeBody(body, mergingExtraBody: custom.extraBody)
 
         do {
             return try await withNetworkRetry {
@@ -355,10 +395,50 @@ private struct AnthropicRequest: Encodable {
                     text.cacheControl = cacheControl
                     content[index] = .text(text)
                     return
-                case .image, .toolUse, .toolResult:
+                case .image, .toolUse, .toolResult, .thinking, .redactedThinking:
                     continue
                 }
             }
+        }
+    }
+
+    enum ToolChoice: Encodable {
+        case auto
+        case any
+        case tool(name: String)
+        case disabled
+
+        init(from choice: AnthropicOAuthLanguageModel.CustomGenerationOptions.ToolChoice) {
+            switch choice {
+            case .auto: self = .auto
+            case .any: self = .any
+            case let .tool(name): self = .tool(name: name)
+            case .disabled: self = .disabled
+            }
+        }
+
+        private enum CodingKeys: String, CodingKey { case type, name }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            switch self {
+            case .auto: try container.encode("auto", forKey: .type)
+            case .any: try container.encode("any", forKey: .type)
+            case let .tool(name):
+                try container.encode("tool", forKey: .type)
+                try container.encode(name, forKey: .name)
+            case .disabled: try container.encode("none", forKey: .type)
+            }
+        }
+    }
+
+    struct Thinking: Encodable {
+        let type: String
+        let budgetTokens: Int
+
+        init(budgetTokens: Int) {
+            self.type = "enabled"
+            self.budgetTokens = budgetTokens
         }
     }
 
@@ -368,6 +448,12 @@ private struct AnthropicRequest: Encodable {
     let messages: [Message]
     let tools: [AnthropicTool]?
     let stream: Bool = false
+    var temperature: Double?
+    var topP: Double?
+    var topK: Int?
+    var stopSequences: [String]?
+    var toolChoice: ToolChoice?
+    var thinking: Thinking?
 }
 
 // MARK: - AnthropicTool
@@ -392,6 +478,8 @@ private struct AnthropicResponse: Decodable {
         case image(Image)
         case toolUse(ToolUse)
         case toolResult(ToolResult)
+        case thinking(Thinking)
+        case redactedThinking(RedactedThinking)
 
         // MARK: Lifecycle
 
@@ -406,13 +494,23 @@ private struct AnthropicResponse: Decodable {
                 self = try .toolUse(ToolUse(from: decoder))
             case .toolResult:
                 self = try .toolResult(ToolResult(from: decoder))
+            case .thinking:
+                self = try .thinking(Thinking(from: decoder))
+            case .redactedThinking:
+                self = try .redactedThinking(RedactedThinking(from: decoder))
             }
         }
 
         // MARK: Internal
 
         enum CodingKeys: String, CodingKey { case type }
-        enum ContentType: String, Codable { case text, image, toolUse = "tool_use", toolResult = "tool_result" }
+        enum ContentType: String, Codable {
+            case text, image
+            case toolUse = "tool_use"
+            case toolResult = "tool_result"
+            case thinking
+            case redactedThinking = "redacted_thinking"
+        }
 
         func encode(to encoder: any Encoder) throws {
             switch self {
@@ -420,7 +518,37 @@ private struct AnthropicResponse: Decodable {
             case let .image(value): try value.encode(to: encoder)
             case let .toolUse(value): try value.encode(to: encoder)
             case let .toolResult(value): try value.encode(to: encoder)
+            case let .thinking(value): try value.encode(to: encoder)
+            case let .redactedThinking(value): try value.encode(to: encoder)
             }
+        }
+    }
+
+    /// A thinking block emitted by Claude during extended thinking. The
+    /// `signature` must be preserved verbatim and replayed in subsequent
+    /// requests within the same tool-use turn, otherwise Anthropic
+    /// rejects the request.
+    struct Thinking: Codable {
+        let type: String
+        let thinking: String
+        let signature: String?
+
+        init(thinking: String, signature: String?) {
+            self.type = "thinking"
+            self.thinking = thinking
+            self.signature = signature
+        }
+    }
+
+    /// A thinking block whose contents have been redacted by Anthropic's
+    /// safety systems. Opaque to clients but must still be replayed.
+    struct RedactedThinking: Codable {
+        let type: String
+        let data: String
+
+        init(data: String) {
+            self.type = "redacted_thinking"
+            self.data = data
         }
     }
 
