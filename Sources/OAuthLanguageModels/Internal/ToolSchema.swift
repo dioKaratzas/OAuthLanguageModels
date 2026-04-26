@@ -2,7 +2,7 @@ import AnyLanguageModel
 import Foundation
 
 func providerToolSchemaJSONValue(for schema: GenerationSchema) throws -> JSONValue {
-    let data = try JSONEncoder().encode(schema)
+    let data = try JSONEncoder.deterministic.encode(schema)
     let value = try JSONDecoder().decode(JSONValue.self, from: data)
     return resolveRootSchema(value)
 }

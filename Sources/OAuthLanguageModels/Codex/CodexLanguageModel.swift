@@ -320,7 +320,7 @@ public struct CodexLanguageModel: LanguageModel {
             case let .string(string):
                 argumentsJSON = string
             case let .object(object):
-                let data = try JSONEncoder().encode(JSONValue.object(object))
+                let data = try JSONEncoder.deterministic.encode(JSONValue.object(object))
                 argumentsJSON = String(data: data, encoding: .utf8) ?? "{}"
             default:
                 argumentsJSON = "{}"
@@ -359,7 +359,7 @@ public struct CodexLanguageModel: LanguageModel {
     }
 
     private static func encodedJSONString(for content: GeneratedContent) throws -> String {
-        let data = try JSONEncoder().encode(content)
+        let data = try JSONEncoder.deterministic.encode(content)
         return String(data: data, encoding: .utf8) ?? "{}"
     }
 
@@ -430,7 +430,10 @@ public struct CodexLanguageModel: LanguageModel {
         request.setValue(sessionID, forHTTPHeaderField: "session_id")
         request.setValue(sessionID, forHTTPHeaderField: "x-client-request-id")
         request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
-        let requestBody = try JSONEncoder().encode(
+        // Body keys are already snake_case literals; use the deterministic
+        // encoder so nested JSON Schema keys (e.g. `additionalProperties`)
+        // are preserved verbatim and dictionary key order is stable.
+        let requestBody = try JSONEncoder.deterministic.encode(
             Self.makeRequestBody(
                 model: model,
                 instructions: resolvedInstructions(instructions),
