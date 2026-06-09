@@ -1,6 +1,13 @@
 # OAuthLanguageModels
 
-[`AnyLanguageModel`](https://github.com/huggingface/AnyLanguageModel) backends that talk to **Anthropic Claude** and **OpenAI ChatGPT / Codex** using a user's existing Claude or ChatGPT subscription, instead of a paid API key.
+Language-model backends that talk to **Anthropic Claude** and **OpenAI ChatGPT / Codex** using a user's existing Claude or ChatGPT subscription, instead of a paid API key.
+
+`AnthropicOAuthLanguageModel` and `CodexLanguageModel` each conform to **both**:
+
+- [`AnyLanguageModel.LanguageModel`](https://github.com/huggingface/AnyLanguageModel) — works on macOS 14 / iOS 17 / visionOS 1 and up.
+- `FoundationModels.LanguageModel` (Apple's framework) — additionally available on iOS 27 / macOS 27 / visionOS 27+.
+
+Use whichever framework's `LanguageModelSession` you like; the same model value works with both.
 
 Two pieces, used independently:
 
@@ -18,21 +25,45 @@ Two pieces, used independently:
     name: "MyApp",
     dependencies: [
         .product(name: "OAuthLanguageModels", package: "OAuthLanguageModels"),
-        .product(name: "AnyLanguageModel", package: "AnyLanguageModel"),
     ]
 )
 ```
 
-Requires Swift 6.1+, macOS 14, iOS 17, tvOS 17, watchOS 10, visionOS 1, or Mac Catalyst 17.
+Requires Swift 6.1+. Matches AnyLanguageModel's platforms: macOS 14+, Mac Catalyst 17+, iOS 17+, tvOS 17+, watchOS 10+, visionOS 1+. The `FoundationModels` conformance is gated to the 27-series OSes (iOS 27 / macOS 27 / visionOS 27 / watchOS 27, tvOS unavailable); on older OS versions use the `AnyLanguageModel` conformance.
 
 ## Using the language models
 
-Both models conform to `AnyLanguageModel.LanguageModel` and work with `LanguageModelSession`, structured generation (`Generable`), tool calls, and streaming.
+Both models work with structured generation (`Generable`), tool calls, and streaming through either framework's `LanguageModelSession`.
+
+### With AnyLanguageModel (any supported OS)
+
+```swift
+import AnyLanguageModel
+import OAuthLanguageModels
+
+let model = AnthropicOAuthLanguageModel(
+    tokenProvider: { "sk-ant-oat01-…" },
+    model: "claude-sonnet-4-5"
+)
+let session = LanguageModelSession(model: model)   // AnyLanguageModel.LanguageModelSession
+let response = try await session.respond(to: "Write a haiku about Swift.")
+print(response.content)
+```
+
+Add the `AnyLanguageModel` product to your target when you use this path:
+
+```swift
+.product(name: "AnyLanguageModel", package: "AnyLanguageModel"),
+```
+
+### With Apple's FoundationModels (iOS/macOS/visionOS 27+)
+
+The examples below import `FoundationModels`. The same model values are used; just pick the import that matches the `LanguageModelSession` you want.
 
 ### Anthropic
 
 ```swift
-import AnyLanguageModel
+import FoundationModels
 import OAuthLanguageModels
 
 let model = AnthropicOAuthLanguageModel(
@@ -50,7 +81,7 @@ print(response.content)
 ### Codex / ChatGPT
 
 ```swift
-import AnyLanguageModel
+import FoundationModels
 import OAuthLanguageModels
 
 let model = CodexLanguageModel(
@@ -61,8 +92,8 @@ let model = CodexLanguageModel(
 )
 
 let session = LanguageModelSession(model: model)
-for try await chunk in session.streamResponse(to: "Stream me some prose.") {
-    print(chunk, terminator: "")
+for try await snapshot in session.streamResponse(to: "Stream me some prose.") {
+    print(snapshot.content, terminator: "")
 }
 ```
 

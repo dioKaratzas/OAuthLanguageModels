@@ -1,7 +1,10 @@
 import AnyLanguageModel
 import Foundation
 
-func providerToolSchemaJSONValue(for schema: GenerationSchema) throws -> JSONValue {
+/// Encodes any `GenerationSchema`-like value (from either AnyLanguageModel
+/// or FoundationModels) into the provider JSON Schema shape. Generic over
+/// `Encodable` so both framework variants can share one implementation.
+func providerToolSchemaJSONValue(forEncodableSchema schema: some Encodable) throws -> JSONValue {
     let data = try JSONEncoder.deterministic.encode(schema)
     let value = try JSONDecoder().decode(JSONValue.self, from: data)
     return resolveRootSchema(value)

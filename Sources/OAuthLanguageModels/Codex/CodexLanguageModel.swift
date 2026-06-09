@@ -5,12 +5,16 @@ public let defaultCodexResponsesBaseURL = URL(string: "https://chatgpt.com/backe
 
 // MARK: - CodexLanguageModel
 
-/// `LanguageModel` implementation that talks to ChatGPT / Codex over the
-/// undocumented `/backend-api/codex/responses` SSE endpoint, authenticated
-/// with a ChatGPT account access token (typically obtained via
-/// `CodexOAuthFlow`).
+/// Talks to ChatGPT / Codex over the undocumented
+/// `/backend-api/codex/responses` SSE endpoint, authenticated with a ChatGPT
+/// account access token (typically obtained via `CodexOAuthFlow`).
 ///
-/// Drop into any `LanguageModelSession` from AnyLanguageModel:
+/// This single type conforms to **both** language-model protocols:
+///
+/// - `AnyLanguageModel.LanguageModel` on all supported OS versions
+///   (see `CodexLanguageModel+AnyLanguageModel.swift`).
+/// - `FoundationModels.LanguageModel` on iOS/macOS/visionOS/watchOS 27+
+///   (see `CodexLanguageModel+FoundationModels.swift`).
 ///
 /// ```swift
 /// let model = CodexLanguageModel(
@@ -19,7 +23,7 @@ public let defaultCodexResponsesBaseURL = URL(string: "https://chatgpt.com/backe
 /// )
 /// let session = LanguageModelSession(model: model)
 /// ```
-public struct CodexLanguageModel: LanguageModel {
+public struct CodexLanguageModel: Sendable {
     // MARK: Lifecycle
 
     public init(
@@ -39,8 +43,6 @@ public struct CodexLanguageModel: LanguageModel {
 
     // MARK: Public
 
-    public typealias UnavailableReason = Never
-
     public let tokenProvider: @Sendable () async throws -> CodexToken
     public let model: String
     public let baseURL: URL
@@ -49,119 +51,74 @@ public struct CodexLanguageModel: LanguageModel {
     /// and audited server-side.
     public let originator: String
 
-    public func respond<Content: Generable>(
-        within session: LanguageModelSession,
-        to _: Prompt,
-        generating type: Content.Type,
-        includeSchemaInPrompt _: Bool,
-        options: GenerationOptions
-    ) async throws -> LanguageModelSession.Response<Content> {
-        guard type == String.self else {
-            throw CodexLanguageModelError.unsupportedContentType
-        }
+    // MARK: Internal
 
-        let custom = options[custom: Self.self] ?? .init()
-        var inputs = try await buildInputs(from: session.transcript)
-        let tools = session.tools.map(Self.convertToolToOpenResponsesFormat)
-        var entries: [Transcript.Entry] = []
-
-        while true {
-            let response = try await send(
-                inputs: inputs,
-                instructions: session.instructions?.description,
-                tools: tools.isEmpty ? nil : tools,
-                options: options,
-                custom: custom
-            )
-
-            // Reasoning items appear in `output` ahead of any
-            // `function_call` / `message` items in the same turn. They
-            // must be replayed in subsequent requests within this same
-            // tool-loop so the model retains its chain of thought across
-            // rounds (required because `store: false`).
-            inputs.append(contentsOf: response.reasoningItems)
-
-            let toolCalls = response.toolCalls
-            if !toolCalls.isEmpty {
-                await state.remember(toolCalls)
-                inputs.append(contentsOf: Self.makeFunctionCallItems(for: toolCalls))
-
-                let resolution = try await resolveToolCalls(toolCalls, session: session)
-                switch resolution {
-                case let .stop(calls):
-                    if !calls.isEmpty {
-                        entries.append(.toolCalls(Transcript.ToolCalls(calls)))
-                    }
-                    let empty = try emptyResponseContent(for: type)
-                    return LanguageModelSession.Response(
-                        content: empty.content,
-                        rawContent: empty.rawContent,
-                        transcriptEntries: ArraySlice(entries)
-                    )
-                case let .invocations(invocations):
-                    if !invocations.isEmpty {
-                        entries.append(.toolCalls(Transcript.ToolCalls(invocations.map(\.call))))
-                        for invocation in invocations {
-                            entries.append(.toolOutput(invocation.output))
-                            inputs.append(Self.makeFunctionCallOutput(for: invocation.output))
-                        }
-                        continue
-                    }
-                }
-            }
-
-            let text = response.outputText ?? Self.extractText(from: response.output) ?? ""
-            guard text.isEmpty == false || response.output != nil else {
-                throw CodexLanguageModelError.noResponseGenerated
-            }
-            return LanguageModelSession.Response(
-                content: text as! Content,
-                rawContent: GeneratedContent(text),
-                transcriptEntries: ArraySlice(entries)
-            )
-        }
-    }
-
-    public func streamResponse<Content: Generable>(
-        within session: LanguageModelSession,
-        to prompt: Prompt,
-        generating type: Content.Type,
-        includeSchemaInPrompt: Bool,
-        options: GenerationOptions
-    ) -> sending LanguageModelSession.ResponseStream<Content> {
-        let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init { continuation in
-            let task = Task {
-                do {
-                    let response = try await respond(
-                        within: session,
-                        to: prompt,
-                        generating: type,
-                        includeSchemaInPrompt: includeSchemaInPrompt,
-                        options: options
-                    )
-                    continuation.yield(.init(content: response.content.asPartiallyGenerated(), rawContent: response.rawContent))
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
-
-        return LanguageModelSession.ResponseStream(stream: stream)
-    }
-
-    // MARK: Fileprivate
-
-    /// Top-level request keys callers may not override via
-    /// `CustomGenerationOptions.extraBody`. These either define the
-    /// OAuth/Codex request shape, are required for cross-call cache
-    /// stability (`prompt_cache_key`), or are required for reasoning
-    /// replay correctness (`include`).
-    fileprivate static let reservedBodyKeys: Set<String> = [
+    /// Top-level request keys callers may not override via `extraBody`.
+    static let reservedBodyKeys: Set<String> = [
         "model", "input", "instructions", "tools",
         "prompt_cache_key", "store", "stream", "include"
     ]
+
+    /// Maps `call_id` -> `item_id` so function calls can be replayed with
+    /// their original item identifiers across turns in a session.
+    let state: CodexSessionState
+
+    func send(
+        inputs: [CodexInputItem],
+        instructions: String?,
+        tools: [OpenResponsesTool]?,
+        parameters: CodexRequestParameters
+    ) async throws -> CodexStreamingResponse {
+        let token = try await tokenProvider()
+        let url = resolveCodexURL(from: baseURL)
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = defaultLLMRequestTimeout
+        request.setValue("Bearer \(token.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(token.accountID, forHTTPHeaderField: "chatgpt-account-id")
+        request.setValue(originator, forHTTPHeaderField: "originator")
+        request.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
+        request.setValue("text/event-stream", forHTTPHeaderField: "accept")
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.setValue(sessionID, forHTTPHeaderField: "session_id")
+        request.setValue(sessionID, forHTTPHeaderField: "x-client-request-id")
+        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+
+        let requestBody = try JSONEncoder.deterministic.encode(
+            Self.makeRequestBody(
+                model: model,
+                instructions: resolvedInstructions(instructions),
+                inputs: inputs.map(\.json),
+                tools: tools,
+                promptCacheKey: sessionID,
+                parameters: parameters
+            )
+        )
+        request.httpBody = requestBody
+
+        do {
+            return try await withNetworkRetry {
+                let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw CodexLanguageModelError.invalidResponse
+                }
+
+                guard (200..<300).contains(httpResponse.statusCode) else {
+                    let data = try await collect(bytes)
+                    let message = String(decoding: data, as: UTF8.self)
+                    if isRetryableHTTPStatus(httpResponse.statusCode) {
+                        throw RetryableServerError(statusCode: httpResponse.statusCode, message: message)
+                    }
+                    throw CodexLanguageModelError.requestFailed(statusCode: httpResponse.statusCode, message: message)
+                }
+
+                return try await parseSSE(bytes: bytes)
+            }
+        } catch let retryable as RetryableServerError {
+            throw CodexLanguageModelError.requestFailed(statusCode: retryable.statusCode, message: retryable.message)
+        }
+    }
 
     // MARK: Private
 
@@ -179,95 +136,16 @@ public struct CodexLanguageModel: LanguageModel {
         return "OAuthLanguageModels (\(osName) \(version.majorVersion).\(version.minorVersion).\(version.patchVersion))"
     }
 
-    private let state: CodexSessionState
-
-    private static func convertPromptSegments(_ segments: [Transcript.Segment], assistant: Bool) -> [JSONValue] {
-        segments.compactMap { segment -> JSONValue? in
-            switch segment {
-            case let .text(text):
-                return JSONValue.object([
-                    "type": .string(assistant ? "output_text" : "input_text"),
-                    "text": .string(text.content)
-                ])
-            case let .structure(structured):
-                let text: String = switch structured.content.kind {
-                case let .string(value):
-                    value
-                default:
-                    structured.content.jsonString
-                }
-                return JSONValue.object([
-                    "type": .string(assistant ? "output_text" : "input_text"),
-                    "text": .string(text)
-                ])
-            case let .image(image):
-                switch image.source {
-                case let .url(url):
-                    return JSONValue.object(["type": .string("input_image"), "image_url": .string(url.absoluteString)])
-                case let .data(data, mimeType):
-                    return JSONValue.object([
-                        "type": .string("input_image"),
-                        "image_url": .string("data:\(mimeType);base64,\(data.base64EncodedString())")
-                    ])
-                }
-            }
-        }
-    }
-
-    private static func makeFunctionCallItems(for calls: [ProviderToolCall]) -> [JSONValue] {
-        calls.map { call in
-            .object([
-                "id": .string(call.itemID ?? call.id),
-                "type": .string("function_call"),
-                "call_id": .string(call.id),
-                "name": .string(call.name),
-                "arguments": .string((try? encodedJSONString(for: call.arguments)) ?? "{}")
-            ])
-        }
-    }
-
-    private static func makeFunctionCallOutput(for output: Transcript.ToolOutput) -> JSONValue {
-        .object([
-            "type": .string("function_call_output"),
-            "call_id": .string(output.id),
-            "output": .string(toolOutputString(output.segments))
-        ])
-    }
-
-    private static func toolOutputString(_ segments: [Transcript.Segment]) -> String {
-        segments.compactMap { segment in
-            switch segment {
-            case let .text(text):
-                text.content
-            case let .structure(structured):
-                switch structured.content.kind {
-                case let .string(value):
-                    value
-                default:
-                    structured.content.jsonString
-                }
-            case .image:
-                nil
-            }
-        }.joined(separator: "\n")
-    }
-
-    private static func convertToolToOpenResponsesFormat(_ tool: any Tool) -> OpenResponsesTool {
-        let parameters = try? providerToolSchemaJSONValue(for: tool.parameters)
-        return OpenResponsesTool(name: tool.name, description: tool.description, parameters: parameters)
-    }
-
     private static func makeRequestBody(
         model: String,
         instructions: String,
         inputs: [JSONValue],
         tools: [OpenResponsesTool]?,
         promptCacheKey: String,
-        options: GenerationOptions,
-        custom: CustomGenerationOptions
+        parameters: CodexRequestParameters
     ) -> JSONValue {
-        let verbosity = custom.verbosity?.rawValue ?? "medium"
-        let parallel = custom.parallelToolCalls ?? true
+        let verbosity = parameters.verbosity ?? "medium"
+        let parallel = parameters.parallelToolCalls ?? true
 
         var body: [String: JSONValue] = [
             "model": .string(model),
@@ -284,39 +162,33 @@ public struct CodexLanguageModel: LanguageModel {
         if let tools, !tools.isEmpty {
             body["tools"] = .array(tools.map(\.jsonValue))
         }
-
-        // Sampling / generation knobs.
-        if let temperature = options.temperature {
+        if let temperature = parameters.temperature {
             body["temperature"] = .double(temperature)
         }
-        if let topP = custom.topP {
+        if let topP = parameters.topP {
             body["top_p"] = .double(topP)
         }
-        if let maxOutput = custom.maxOutputTokens ?? options.maximumResponseTokens {
+        if let maxOutput = parameters.maxOutputTokens {
             body["max_output_tokens"] = .int(maxOutput)
         }
-        if let maxToolCalls = custom.maxToolCalls {
+        if let maxToolCalls = parameters.maxToolCalls {
             body["max_tool_calls"] = .int(maxToolCalls)
         }
 
-        if let reasoning = custom.reasoning {
-            var reasoningObject: [String: JSONValue] = [:]
-            if let effort = reasoning.effort {
-                reasoningObject["effort"] = .string(effort.rawValue)
-            }
-            if let summary = reasoning.summary {
-                reasoningObject["summary"] = .string(summary.rawValue)
-            }
-            if !reasoningObject.isEmpty {
-                body["reasoning"] = .object(reasoningObject)
-            }
+        var reasoningObject: [String: JSONValue] = [:]
+        if let effort = parameters.reasoningEffort {
+            reasoningObject["effort"] = .string(effort)
+        }
+        if let summary = parameters.reasoningSummary {
+            reasoningObject["summary"] = .string(summary)
+        }
+        if !reasoningObject.isEmpty {
+            body["reasoning"] = .object(reasoningObject)
         }
 
-        // Tool choice (defaults to "auto" if unset).
-        body["tool_choice"] = custom.toolChoice.map(toolChoiceJSON) ?? .string("auto")
+        body["tool_choice"] = parameters.toolChoice ?? .string("auto")
 
-        // extraBody is merged last and may not override reserved keys.
-        if let extra = custom.extraBody {
+        if let extra = parameters.extraBody {
             for (key, value) in extra where !reservedBodyKeys.contains(key) {
                 body[key] = value
             }
@@ -325,132 +197,14 @@ public struct CodexLanguageModel: LanguageModel {
         return .object(body)
     }
 
-    private static func toolChoiceJSON(_ choice: CustomGenerationOptions.ToolChoice) -> JSONValue {
-        switch choice {
-        case .none: return .string("none")
-        case .auto: return .string("auto")
-        case .required: return .string("required")
-        case let .function(name):
-            return .object(["type": .string("function"), "name": .string(name)])
-        case let .allowedTools(names, mode):
-            let descriptors = names.map { name in
-                JSONValue.object(["type": .string("function"), "name": .string(name)])
-            }
-            return .object([
-                "type": .string("allowed_tools"),
-                "mode": .string(mode.rawValue),
-                "tools": .array(descriptors)
-            ])
-        }
-    }
-
-    private static func extractToolCalls(from output: [JSONValue]?) throws -> [ProviderToolCall] {
-        guard let output else { return [] }
-        var result: [ProviderToolCall] = []
-        for item in output {
-            collectToolCalls(from: item, into: &result)
-        }
-        return result
-    }
-
-    private static func collectToolCalls(from value: JSONValue, into result: inout [ProviderToolCall]) {
-        switch value {
-        case let .object(object):
-            let type = object["type"].flatMap {
-                if case let .string(string) = $0 { string } else { nil }
-            }
-            if let type, ["function_call", "tool_call", "tool_use"].contains(type),
-               let call = try? parseToolCall(from: object) {
-                result.append(call)
-            }
-            if let item = object["item"] {
-                collectToolCalls(from: item, into: &result)
-            }
-            if let toolCall = object["tool_call"] {
-                collectToolCalls(from: toolCall, into: &result)
-            }
-            if let content = object["content"] {
-                collectToolCalls(from: content, into: &result)
-            }
-            for (key, value) in object where key != "content" && key != "item" && key != "tool_call" {
-                collectToolCalls(from: value, into: &result)
-            }
-        case let .array(array):
-            for item in array {
-                collectToolCalls(from: item, into: &result)
-            }
-        default:
-            break
-        }
-    }
-
-    private static func parseToolCall(from object: [String: JSONValue]) throws -> ProviderToolCall? {
-        let itemID = object["id"].flatMap {
-            if case let .string(string) = $0 { string } else { nil }
-        }
-        let callID = object["call_id"].flatMap {
-            if case let .string(string) = $0 { string } else { nil }
-        } ?? itemID
-        let name = object["name"].flatMap {
-            if case let .string(string) = $0 { string } else { nil }
-        }
-        guard let callID, let name, !callID.isEmpty, !name.isEmpty else { return nil }
-
-        let argumentsJSON: String
-        if let arguments = object["arguments"] {
-            switch arguments {
-            case let .string(string):
-                argumentsJSON = string
-            case let .object(object):
-                let data = try JSONEncoder.deterministic.encode(JSONValue.object(object))
-                argumentsJSON = String(data: data, encoding: .utf8) ?? "{}"
-            default:
-                argumentsJSON = "{}"
-            }
-        } else {
-            argumentsJSON = "{}"
-        }
-
-        return try ProviderToolCall(
-            id: callID,
-            itemID: itemID,
-            name: name,
-            arguments: GeneratedContent(json: argumentsJSON)
-        )
-    }
-
-    private static func extractText(from output: [JSONValue]?) -> String? {
-        guard let output else { return nil }
-        var parts: [String] = []
-        for item in output {
-            guard case let .object(object) = item,
-                  object["type"].flatMap({ if case let .string(string) = $0 { string } else { nil } }) == "message",
-                  case let .array(content)? = object["content"] else {
-                continue
-            }
-            for block in content {
-                guard case let .object(object) = block,
-                      object["type"].flatMap({ if case let .string(string) = $0 { string } else { nil } }) == "output_text",
-                      case let .string(text)? = object["text"] else {
-                    continue
-                }
-                parts.append(text)
-            }
-        }
-        return parts.isEmpty ? nil : parts.joined()
-    }
-
-    private static func encodedJSONString(for content: GeneratedContent) throws -> String {
-        let data = try JSONEncoder.deterministic.encode(content)
-        return String(data: data, encoding: .utf8) ?? "{}"
-    }
+    // MARK: SSE parsing helpers
 
     private static func processEvent(
         _ payload: String,
         accumulatedText: inout String,
         latestOutput: inout [JSONValue]?,
         latestOutputText: inout String?,
-        toolCallsByID: inout [String: ProviderToolCall]
+        toolCallsByID: inout [String: CodexToolCall]
     ) throws {
         guard payload != "[DONE]", !payload.isEmpty else { return }
         guard let data = payload.data(using: .utf8) else { return }
@@ -485,17 +239,95 @@ public struct CodexLanguageModel: LanguageModel {
             }
         }
 
-        var collected: [ProviderToolCall] = []
+        var collected: [CodexToolCall] = []
         collectToolCalls(from: value, into: &collected)
         for call in collected {
             toolCallsByID[call.id] = call
         }
     }
 
+    private static func collectToolCalls(from value: JSONValue, into result: inout [CodexToolCall]) {
+        switch value {
+        case let .object(object):
+            let type = object["type"].flatMap {
+                if case let .string(string) = $0 { string } else { nil }
+            }
+            if let type, ["function_call", "tool_call", "tool_use"].contains(type),
+               let call = parseToolCall(from: object) {
+                result.append(call)
+            }
+            if let item = object["item"] {
+                collectToolCalls(from: item, into: &result)
+            }
+            if let toolCall = object["tool_call"] {
+                collectToolCalls(from: toolCall, into: &result)
+            }
+            if let content = object["content"] {
+                collectToolCalls(from: content, into: &result)
+            }
+            for (key, value) in object where key != "content" && key != "item" && key != "tool_call" {
+                collectToolCalls(from: value, into: &result)
+            }
+        case let .array(array):
+            for item in array {
+                collectToolCalls(from: item, into: &result)
+            }
+        default:
+            break
+        }
+    }
+
+    private static func parseToolCall(from object: [String: JSONValue]) -> CodexToolCall? {
+        let itemID = object["id"].flatMap {
+            if case let .string(string) = $0 { string } else { nil }
+        }
+        let callID = object["call_id"].flatMap {
+            if case let .string(string) = $0 { string } else { nil }
+        } ?? itemID
+        let name = object["name"].flatMap {
+            if case let .string(string) = $0 { string } else { nil }
+        }
+        guard let callID, let name, !callID.isEmpty, !name.isEmpty else { return nil }
+
+        let argumentsJSON: String = if let arguments = object["arguments"] {
+            switch arguments {
+            case let .string(string):
+                string
+            case let .object(object):
+                (try? jsonObjectString(from: object)) ?? "{}"
+            default:
+                "{}"
+            }
+        } else {
+            "{}"
+        }
+
+        return CodexToolCall(id: callID, itemID: itemID, name: name, argumentsJSON: argumentsJSON)
+    }
+
+    private static func extractText(from output: [JSONValue]?) -> String? {
+        guard let output else { return nil }
+        var parts: [String] = []
+        for item in output {
+            guard case let .object(object) = item,
+                  object["type"].flatMap({ if case let .string(string) = $0 { string } else { nil } }) == "message",
+                  case let .array(content)? = object["content"] else {
+                continue
+            }
+            for block in content {
+                guard case let .object(object) = block,
+                      object["type"].flatMap({ if case let .string(string) = $0 { string } else { nil } }) == "output_text",
+                      case let .string(text)? = object["text"] else {
+                    continue
+                }
+                parts.append(text)
+            }
+        }
+        return parts.isEmpty ? nil : parts.joined()
+    }
+
     /// Pull `reasoning` items out of the final response output array, in
-    /// their original order. These are passed back verbatim in the next
-    /// request's `input` so the model retains its chain of thought when
-    /// `store: false`.
+    /// their original order, to replay across turns when `store: false`.
     private static func extractReasoningItems(from output: [JSONValue]?) -> [JSONValue] {
         guard let output else { return [] }
         return output.compactMap { item in
@@ -505,67 +337,6 @@ public struct CodexLanguageModel: LanguageModel {
                 return nil
             }
             return item
-        }
-    }
-
-    private func send(
-        inputs: [JSONValue],
-        instructions: String?,
-        tools: [OpenResponsesTool]?,
-        options: GenerationOptions,
-        custom: CustomGenerationOptions
-    ) async throws -> CodexStreamingResponse {
-        let token = try await tokenProvider()
-        let url = resolveCodexURL(from: baseURL)
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.timeoutInterval = defaultLLMRequestTimeout
-        request.setValue("Bearer \(token.accessToken)", forHTTPHeaderField: "Authorization")
-        request.setValue(token.accountID, forHTTPHeaderField: "chatgpt-account-id")
-        request.setValue(originator, forHTTPHeaderField: "originator")
-        request.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
-        request.setValue("text/event-stream", forHTTPHeaderField: "accept")
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.setValue(sessionID, forHTTPHeaderField: "session_id")
-        request.setValue(sessionID, forHTTPHeaderField: "x-client-request-id")
-        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
-        // Body keys are already snake_case literals; use the deterministic
-        // encoder so nested JSON Schema keys (e.g. `additionalProperties`)
-        // are preserved verbatim and dictionary key order is stable.
-        let requestBody = try JSONEncoder.deterministic.encode(
-            Self.makeRequestBody(
-                model: model,
-                instructions: resolvedInstructions(instructions),
-                inputs: inputs,
-                tools: tools,
-                promptCacheKey: sessionID,
-                options: options,
-                custom: custom
-            )
-        )
-        request.httpBody = requestBody
-
-        do {
-            return try await withNetworkRetry {
-                let (bytes, response) = try await URLSession.shared.bytes(for: request)
-                guard let httpResponse = response as? HTTPURLResponse else {
-                    throw CodexLanguageModelError.invalidResponse
-                }
-
-                guard (200..<300).contains(httpResponse.statusCode) else {
-                    let data = try await collect(bytes)
-                    let message = String(decoding: data, as: UTF8.self)
-                    if isRetryableHTTPStatus(httpResponse.statusCode) {
-                        throw RetryableServerError(statusCode: httpResponse.statusCode, message: message)
-                    }
-                    throw CodexLanguageModelError.requestFailed(statusCode: httpResponse.statusCode, message: message)
-                }
-
-                return try await parseSSE(bytes: bytes)
-            }
-        } catch let retryable as RetryableServerError {
-            throw CodexLanguageModelError.requestFailed(statusCode: retryable.statusCode, message: retryable.message)
         }
     }
 
@@ -587,56 +358,11 @@ public struct CodexLanguageModel: LanguageModel {
         return URL(string: trimmed + "/codex/responses")!
     }
 
-    private func buildInputs(from transcript: Transcript) async throws -> [JSONValue] {
-        var input: [JSONValue] = []
-
-        for entry in transcript {
-            switch entry {
-            case .instructions:
-                break
-            case let .prompt(prompt):
-                input.append(
-                    .object([
-                        "type": .string("message"),
-                        "role": .string("user"),
-                        "content": .array(Self.convertPromptSegments(prompt.segments, assistant: false))
-                    ])
-                )
-            case let .response(response):
-                input.append(
-                    .object([
-                        "type": .string("message"),
-                        "role": .string("assistant"),
-                        "content": .array(Self.convertPromptSegments(response.segments, assistant: true))
-                    ])
-                )
-            case let .toolCalls(toolCalls):
-                for call in toolCalls {
-                    let arguments = try Self.encodedJSONString(for: call.arguments)
-                    let itemID = await state.itemID(for: call.id) ?? call.id
-                    input.append(
-                        .object([
-                            "id": .string(itemID),
-                            "type": .string("function_call"),
-                            "call_id": .string(call.id),
-                            "name": .string(call.toolName),
-                            "arguments": .string(arguments)
-                        ])
-                    )
-                }
-            case let .toolOutput(output):
-                input.append(Self.makeFunctionCallOutput(for: output))
-            }
-        }
-
-        return input
-    }
-
     private func parseSSE(bytes: URLSession.AsyncBytes) async throws -> CodexStreamingResponse {
         var accumulatedText = ""
         var latestOutput: [JSONValue]?
         var latestOutputText: String?
-        var toolCallsByID: [String: ProviderToolCall] = [:]
+        var toolCallsByID: [String: CodexToolCall] = [:]
 
         for try await line in bytes.lines {
             guard line.hasPrefix("data:") else { continue }
@@ -652,10 +378,11 @@ public struct CodexLanguageModel: LanguageModel {
 
         let toolCalls = Array(toolCallsByID.values).sorted { $0.id < $1.id }
         let outputText = accumulatedText.isEmpty ? latestOutputText : accumulatedText
-        let reasoningItems = Self.extractReasoningItems(from: latestOutput)
+        let text = outputText ?? Self.extractText(from: latestOutput)
+        let reasoningItems = Self.extractReasoningItems(from: latestOutput).map { CodexInputItem(json: $0) }
         return CodexStreamingResponse(
-            output: latestOutput,
-            outputText: outputText,
+            text: text,
+            hasOutput: latestOutput != nil,
             toolCalls: toolCalls,
             reasoningItems: reasoningItems
         )
@@ -670,12 +397,30 @@ public struct CodexLanguageModel: LanguageModel {
     }
 }
 
+// MARK: - CodexRequestParameters
+
+/// Framework-agnostic per-request knobs. Each adapter maps its own options
+/// into this shape.
+struct CodexRequestParameters {
+    var temperature: Double?
+    var topP: Double?
+    var maxOutputTokens: Int?
+    var maxToolCalls: Int?
+    var verbosity: String?
+    var parallelToolCalls: Bool?
+    var reasoningEffort: String?
+    var reasoningSummary: String?
+    /// Pre-rendered `tool_choice` value (defaults to `"auto"` when nil).
+    var toolChoice: JSONValue?
+    var extraBody: [String: JSONValue]?
+}
+
 // MARK: - CodexSessionState
 
-private actor CodexSessionState {
+actor CodexSessionState {
     // MARK: Internal
 
-    func remember(_ calls: [ProviderToolCall]) {
+    func remember(_ calls: [CodexToolCall]) {
         for call in calls {
             if let itemID = call.itemID {
                 itemIDsByCallID[call.id] = itemID
@@ -692,9 +437,79 @@ private actor CodexSessionState {
     private var itemIDsByCallID: [String: String] = [:]
 }
 
+// MARK: - CodexToolCall
+
+/// Framework-agnostic representation of a model-issued tool call.
+struct CodexToolCall {
+    let id: String
+    let itemID: String?
+    let name: String
+    /// Raw JSON-object arguments string.
+    let argumentsJSON: String
+}
+
+// MARK: - CodexInputItem
+
+/// Opaque wrapper around a single Responses-API `input` item so adapters can
+/// build request inputs without depending on the JSON representation.
+struct CodexInputItem {
+    let json: JSONValue
+}
+
+extension CodexInputItem {
+    static func userMessage(textSegments: [String], imageURLs: [String]) -> CodexInputItem {
+        var content: [JSONValue] = textSegments.map {
+            .object(["type": .string("input_text"), "text": .string($0)])
+        }
+        content.append(contentsOf: imageURLs.map {
+            .object(["type": .string("input_image"), "image_url": .string($0)])
+        })
+        return CodexInputItem(json: .object([
+            "type": .string("message"),
+            "role": .string("user"),
+            "content": .array(content)
+        ]))
+    }
+
+    static func assistantMessage(textSegments: [String]) -> CodexInputItem {
+        let content: [JSONValue] = textSegments.map {
+            .object(["type": .string("output_text"), "text": .string($0)])
+        }
+        return CodexInputItem(json: .object([
+            "type": .string("message"),
+            "role": .string("assistant"),
+            "content": .array(content)
+        ]))
+    }
+
+    static func functionCall(itemID: String, callID: String, name: String, argumentsJSON: String) -> CodexInputItem {
+        CodexInputItem(json: .object([
+            "id": .string(itemID),
+            "type": .string("function_call"),
+            "call_id": .string(callID),
+            "name": .string(name),
+            "arguments": .string(argumentsJSON)
+        ]))
+    }
+
+    static func functionCallOutput(callID: String, output: String) -> CodexInputItem {
+        CodexInputItem(json: .object([
+            "type": .string("function_call_output"),
+            "call_id": .string(callID),
+            "output": .string(output)
+        ]))
+    }
+
+    static func functionCalls(for calls: [CodexToolCall]) -> [CodexInputItem] {
+        calls.map {
+            .functionCall(itemID: $0.itemID ?? $0.id, callID: $0.id, name: $0.name, argumentsJSON: $0.argumentsJSON)
+        }
+    }
+}
+
 // MARK: - OpenResponsesTool
 
-private struct OpenResponsesTool {
+struct OpenResponsesTool {
     let type: String = "function"
     let name: String
     let description: String
@@ -713,16 +528,22 @@ private struct OpenResponsesTool {
     }
 }
 
+/// Builds an `OpenResponsesTool` from any encodable schema.
+func makeOpenResponsesTool(name: String, description: String, schema: some Encodable) -> OpenResponsesTool {
+    let parameters = try? providerToolSchemaJSONValue(forEncodableSchema: schema)
+    return OpenResponsesTool(name: name, description: description, parameters: parameters)
+}
+
 // MARK: - CodexStreamingResponse
 
-private struct CodexStreamingResponse {
-    let output: [JSONValue]?
-    let outputText: String?
-    let toolCalls: [ProviderToolCall]
-    /// Encrypted `reasoning` items emitted by the model in `output`,
-    /// preserved verbatim so the caller can replay them in subsequent
-    /// requests within the same `LanguageModelSession`.
-    let reasoningItems: [JSONValue]
+struct CodexStreamingResponse {
+    /// Final assistant text (accumulated deltas or extracted output).
+    let text: String?
+    /// Whether the response carried an `output` array at all.
+    let hasOutput: Bool
+    let toolCalls: [CodexToolCall]
+    /// Encrypted `reasoning` items to replay in subsequent requests.
+    let reasoningItems: [CodexInputItem]
 }
 
 // MARK: - CodexLanguageModelError
