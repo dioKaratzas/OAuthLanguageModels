@@ -38,13 +38,17 @@ public struct AnthropicOAuthLanguageModel: Sendable {
         model: String,
         baseURL: URL = defaultAnthropicBaseURL,
         maxTokens: Int = 4096,
-        longCacheRetention: Bool = false
+        longCacheRetention: Bool = false,
+        extraBetas: [String] = [],
+        extraHeaders: [String: String] = [:]
     ) {
         self.tokenProvider = tokenProvider
         self.model = model
         self.baseURL = baseURL
         self.maxTokens = maxTokens
         self.longCacheRetention = longCacheRetention
+        self.extraBetas = extraBetas
+        self.extraHeaders = extraHeaders
     }
 
     // MARK: Public
@@ -55,6 +59,21 @@ public struct AnthropicOAuthLanguageModel: Sendable {
     public let maxTokens: Int
     public let longCacheRetention: Bool
 
+    /// Beta names appended to the `anthropic-beta` header, after the ones the
+    /// OAuth/Claude Code request shape requires.
+    ///
+    /// Features that are opted into by header rather than by body key need this:
+    /// fast mode, for one, is `speed: "fast"` in `extraBody` *and*
+    /// `fast-mode-2026-02-01` here — either half alone is refused.
+    public let extraBetas: [String]
+
+    /// Extra header fields to set on every request.
+    ///
+    /// Fields the OAuth request shape depends on are dropped, the same way
+    /// ``reservedBodyKeys`` protects the body: they are what the API honours a
+    /// subscription token for, and overriding them only produces a 401.
+    public let extraHeaders: [String: String]
+
     // MARK: Internal
 
     /// Top-level body keys that callers may not override via `extraBody`.
@@ -62,6 +81,17 @@ public struct AnthropicOAuthLanguageModel: Sendable {
     static let reservedBodyKeys: Set<String> = [
         "model", "system", "messages", "tools"
     ]
+
+    /// Header fields that callers may not override via `extraHeaders`, lowercased.
+    static let reservedHeaderFields: Set<String> = [
+        "authorization", "anthropic-version", "anthropic-beta", "user-agent",
+        "x-app", "accept", "content-type"
+    ]
+
+    /// The betas the OAuth path requires, plus whatever the caller added.
+    var betaHeaderValue: String {
+        (["claude-code-20250219", "oauth-2025-04-20"] + extraBetas).joined(separator: ",")
+    }
 
     var cacheControl: AnthropicRequest.CacheControl {
         longCacheRetention ? .ephemeralLong : .ephemeral
@@ -84,12 +114,13 @@ public struct AnthropicOAuthLanguageModel: Sendable {
         return try JSONEncoder.deterministic.encode(JSONValue.object(object))
     }
 
-    func send(
+    func makeRequest(
+        streaming: Bool,
         messages: [AnthropicRequest.Message],
         instructions: String?,
         tools: [AnthropicTool]?,
         parameters: AnthropicRequestParameters
-    ) async throws -> AnthropicResponse {
+    ) async throws -> URLRequest {
         let accessToken = try await tokenProvider()
 
         var url = baseURL
@@ -103,12 +134,15 @@ public struct AnthropicOAuthLanguageModel: Sendable {
         request.timeoutInterval = defaultLLMRequestTimeout
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.setValue("claude-code-20250219,oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        request.setValue(betaHeaderValue, forHTTPHeaderField: "anthropic-beta")
         request.setValue("true", forHTTPHeaderField: "anthropic-dangerous-direct-browser-access")
         request.setValue("claude-cli/\(claudeCodeVersion)", forHTTPHeaderField: "user-agent")
         request.setValue("cli", forHTTPHeaderField: "x-app")
-        request.setValue("application/json", forHTTPHeaderField: "accept")
+        request.setValue(streaming ? "text/event-stream" : "application/json", forHTTPHeaderField: "accept")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
+        for (field, value) in extraHeaders where !Self.reservedHeaderFields.contains(field.lowercased()) {
+            request.setValue(value, forHTTPHeaderField: field)
+        }
 
         var system = [AnthropicRequest.TextBlock(text: claudeCodeSystemPreamble)]
         if let instructions, !instructions.isEmpty {
@@ -129,6 +163,7 @@ public struct AnthropicOAuthLanguageModel: Sendable {
             system: system,
             messages: cachedMessages,
             tools: tools,
+            stream: streaming,
             temperature: parameters.temperature,
             topP: parameters.topP,
             topK: parameters.topK,
@@ -137,6 +172,22 @@ public struct AnthropicOAuthLanguageModel: Sendable {
             thinking: parameters.thinkingBudgetTokens.map { .init(budgetTokens: $0) }
         )
         request.httpBody = try Self.encodeBody(body, mergingExtraBody: parameters.extraBody)
+        return request
+    }
+
+    func send(
+        messages: [AnthropicRequest.Message],
+        instructions: String?,
+        tools: [AnthropicTool]?,
+        parameters: AnthropicRequestParameters
+    ) async throws -> AnthropicResponse {
+        let request = try await makeRequest(
+            streaming: false,
+            messages: messages,
+            instructions: instructions,
+            tools: tools,
+            parameters: parameters
+        )
 
         do {
             return try await withNetworkRetry {
@@ -163,6 +214,107 @@ public struct AnthropicOAuthLanguageModel: Sendable {
             throw AnthropicOAuthLanguageModelError.requestFailed(statusCode: retryable.statusCode, message: retryable.message)
         }
     }
+
+    /// The answer as it is written, one text delta at a time.
+    ///
+    /// Text only: a stream carrying tool calls has to reassemble each call from its
+    /// `input_json_delta` fragments before anything can be run, which is the
+    /// non-streaming path's job. Callers with tools in play use ``send(messages:instructions:tools:parameters:)``.
+    ///
+    /// Not retried. A retry would replay an answer the caller has already been given
+    /// half of; a stream that fails mid-flight is the caller's to restart.
+    func sendStream(
+        messages: [AnthropicRequest.Message],
+        instructions: String?,
+        parameters: AnthropicRequestParameters
+    ) async throws -> AsyncThrowingStream<String, any Error> {
+        let request = try await makeRequest(
+            streaming: true,
+            messages: messages,
+            instructions: instructions,
+            tools: nil,
+            parameters: parameters
+        )
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        // Before the stream rather than inside it: a refusal is the whole answer, and
+        // the caller should see it thrown rather than delivered as an empty stream.
+        try await Self.checkStreamResponse(response, bytes: bytes)
+
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await line in bytes.lines {
+                        if let delta = try Self.textDelta(in: line) {
+                            continuation.yield(delta)
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// The refusal arrives as the body of a non-2xx, which has to be read off the
+    /// byte stream before it can be reported.
+    private static func checkStreamResponse(
+        _ response: URLResponse,
+        bytes: URLSession.AsyncBytes
+    ) async throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw AnthropicOAuthLanguageModelError.invalidResponse
+        }
+        guard !(200..<300).contains(http.statusCode) else { return }
+
+        var message = ""
+        for try await line in bytes.lines where message.count < 4096 {
+            message += line
+        }
+        throw AnthropicOAuthLanguageModelError.requestFailed(statusCode: http.statusCode, message: message)
+    }
+
+    /// The text an event carries, or nothing for the events that carry none — pings,
+    /// block boundaries, the usage totals at the end.
+    static func textDelta(in line: String) throws -> String? {
+        guard line.hasPrefix("data:") else { return nil }
+        let json = line.dropFirst("data:".count).trimmingCharacters(in: .whitespaces)
+        guard let event = try? JSONDecoder.snakeCase.decode(AnthropicStreamEvent.self, from: Data(json.utf8)) else {
+            return nil
+        }
+        switch event.type {
+        case "content_block_delta":
+            guard event.delta?.type == "text_delta" else { return nil }
+            return event.delta?.text
+        case "error":
+            // Mid-stream failures arrive as an event, with a 200 already on the wire.
+            throw AnthropicOAuthLanguageModelError.requestFailed(
+                statusCode: 200,
+                message: event.error?.message ?? "Anthropic ended the stream with an error."
+            )
+        default:
+            return nil
+        }
+    }
+}
+
+// MARK: - AnthropicStreamEvent
+
+struct AnthropicStreamEvent: Decodable {
+    struct Delta: Decodable {
+        let type: String?
+        let text: String?
+    }
+
+    struct StreamError: Decodable {
+        let type: String?
+        let message: String?
+    }
+
+    let type: String
+    var delta: Delta?
+    var error: StreamError?
 }
 
 // MARK: - AnthropicRequestParameters
@@ -269,7 +421,7 @@ struct AnthropicRequest: Encodable {
     var system: [TextBlock]
     let messages: [Message]
     let tools: [AnthropicTool]?
-    let stream: Bool = false
+    var stream = false
     var temperature: Double?
     var topP: Double?
     var topK: Int?
