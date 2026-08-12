@@ -91,6 +91,58 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
         includeSchemaInPrompt: Bool,
         options: GenerationOptions
     ) -> sending LanguageModelSession.ResponseStream<Content> {
+        // Tools have to be reassembled from their argument fragments and then run, and a
+        // structured type is only decodable once it is whole. Both are answered in one
+        // piece; only plain text can be handed over as it arrives.
+        guard type == String.self, session.tools.isEmpty else {
+            return wholeResponseAsStream(
+                within: session,
+                to: prompt,
+                generating: type,
+                includeSchemaInPrompt: includeSchemaInPrompt,
+                options: options
+            )
+        }
+
+        let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init { continuation in
+            let task = Task {
+                do {
+                    let custom = options[custom: Self.self] ?? .init()
+                    let inputs = try await buildInputs(from: session.transcript)
+                    var text = ""
+                    let deltas = sendStream(
+                        inputs: inputs,
+                        instructions: session.instructions?.description,
+                        tools: nil,
+                        parameters: parameters(options: options, custom: custom)
+                    )
+                    for try await delta in deltas {
+                        text += delta
+                        // Snapshots are cumulative: each one is the answer so far, not the
+                        // piece that just landed.
+                        let content = text as! Content
+                        continuation.yield(
+                            .init(content: content.asPartiallyGenerated(), rawContent: GeneratedContent(text))
+                        )
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+
+        return LanguageModelSession.ResponseStream(stream: stream)
+    }
+
+    private func wholeResponseAsStream<Content: Generable>(
+        within session: LanguageModelSession,
+        to prompt: Prompt,
+        generating type: Content.Type,
+        includeSchemaInPrompt: Bool,
+        options: GenerationOptions
+    ) -> sending LanguageModelSession.ResponseStream<Content> {
         let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init { continuation in
             let task = Task {
                 do {

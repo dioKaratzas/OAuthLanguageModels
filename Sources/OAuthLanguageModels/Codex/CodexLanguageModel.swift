@@ -63,11 +63,40 @@ public struct CodexLanguageModel: Sendable {
     /// their original item identifiers across turns in a session.
     let state: CodexSessionState
 
-    func send(
+    /// Streams a request's text deltas as they arrive, for a plain-text turn with no
+    /// tools to reassemble. Each element is the piece that just landed, not the answer
+    /// so far.
+    func sendStream(
         inputs: [CodexInputItem],
         instructions: String?,
         tools: [OpenResponsesTool]?,
         parameters: CodexRequestParameters
+    ) -> AsyncThrowingStream<String, any Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    _ = try await send(
+                        inputs: inputs,
+                        instructions: instructions,
+                        tools: tools,
+                        parameters: parameters,
+                        onDelta: { continuation.yield($0) }
+                    )
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    func send(
+        inputs: [CodexInputItem],
+        instructions: String?,
+        tools: [OpenResponsesTool]?,
+        parameters: CodexRequestParameters,
+        onDelta: (@Sendable (String) -> Void)? = nil
     ) async throws -> CodexStreamingResponse {
         let token = try await tokenProvider()
         let url = resolveCodexURL(from: baseURL)
@@ -113,7 +142,7 @@ public struct CodexLanguageModel: Sendable {
                     throw CodexLanguageModelError.requestFailed(statusCode: httpResponse.statusCode, message: message)
                 }
 
-                return try await parseSSE(bytes: bytes)
+                return try await parseSSE(bytes: bytes, onDelta: onDelta)
             }
         } catch let retryable as RetryableServerError {
             throw CodexLanguageModelError.requestFailed(statusCode: retryable.statusCode, message: retryable.message)
@@ -199,12 +228,13 @@ public struct CodexLanguageModel: Sendable {
 
     // MARK: SSE parsing helpers
 
-    private static func processEvent(
+    static func processEvent(
         _ payload: String,
         accumulatedText: inout String,
         latestOutput: inout [JSONValue]?,
         latestOutputText: inout String?,
-        toolCallsByID: inout [String: CodexToolCall]
+        toolCallsByID: inout [String: CodexToolCall],
+        onDelta: (@Sendable (String) -> Void)? = nil
     ) throws {
         guard payload != "[DONE]", !payload.isEmpty else { return }
         guard let data = payload.data(using: .utf8) else { return }
@@ -221,6 +251,7 @@ public struct CodexLanguageModel: Sendable {
                type == "response.output_text.delta",
                let delta = object["delta"].flatMap({ if case let .string(string) = $0 { string } else { nil } }) {
                 accumulatedText += delta
+                onDelta?(delta)
             }
 
             if let outputText = object["output_text"].flatMap({ if case let .string(string) = $0 { string } else { nil } }) {
@@ -358,7 +389,10 @@ public struct CodexLanguageModel: Sendable {
         return URL(string: trimmed + "/codex/responses")!
     }
 
-    private func parseSSE(bytes: URLSession.AsyncBytes) async throws -> CodexStreamingResponse {
+    private func parseSSE(
+        bytes: URLSession.AsyncBytes,
+        onDelta: (@Sendable (String) -> Void)? = nil
+    ) async throws -> CodexStreamingResponse {
         var accumulatedText = ""
         var latestOutput: [JSONValue]?
         var latestOutputText: String?
@@ -372,7 +406,8 @@ public struct CodexLanguageModel: Sendable {
                 accumulatedText: &accumulatedText,
                 latestOutput: &latestOutput,
                 latestOutputText: &latestOutputText,
-                toolCallsByID: &toolCallsByID
+                toolCallsByID: &toolCallsByID,
+                onDelta: onDelta
             )
         }
 

@@ -27,6 +27,10 @@ let package = Package(
             dependencies: [
                 .product(name: "AnyLanguageModel", package: "AnyLanguageModel")
             ]
+        ),
+        .testTarget(
+            name: "OAuthLanguageModelsTests",
+            dependencies: ["OAuthLanguageModels"]
         )
     ],
     swiftLanguageModes: [.v6]
