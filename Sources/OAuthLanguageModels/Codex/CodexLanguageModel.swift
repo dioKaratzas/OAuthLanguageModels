@@ -79,6 +79,11 @@ public struct CodexLanguageModel: Sendable {
         "prompt_cache_key", "store", "stream", "include"
     ]
 
+    /// What each streamed tool-using turn put on the wire, so a later turn can replay it
+    /// exactly. Static and keyed by session, so rebuilding the model between turns of the
+    /// same conversation does not lose the record.
+    static let streamedTurns = StreamedTurnStore<CodexInputItem>()
+
     /// Maps `call_id` -> `item_id` so function calls can be replayed with
     /// their original item identifiers across turns in a session.
     let state: CodexSessionState

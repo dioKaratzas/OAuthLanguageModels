@@ -16,7 +16,7 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
         let custom = options[custom: Self.self] ?? .init()
         let schema = try structuredSchema(for: type)
         let instructions = try Self.instructions(session, schema: schema, inPrompt: includeSchemaInPrompt)
-        var messages = try Self.buildMessages(from: session.transcript)
+        var messages = try Self.buildMessages(from: session)
         let tools = try session.tools.map(Self.convertTool)
         var entries: [Transcript.Entry] = []
         var rounds = 0
@@ -124,9 +124,13 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
                     let schema = try structuredSchema(for: type)
                     let instructions = try Self.instructions(session, schema: schema, inPrompt: includeSchemaInPrompt)
                     let tools = try session.tools.map(Self.convertTool)
-                    var messages = try Self.buildMessages(from: session.transcript)
+                    let replayed = try Self.buildMessages(from: session)
+                    var messages = replayed
                     var answer = StreamedAnswer<Content>(isStructured: schema != nil)
                     var rounds = 0
+                    // The response this turn becomes, so its tool rounds can be found
+                    // again when the next turn rebuilds the conversation.
+                    let responseIndex = session.transcript.responseCount
 
                     while true {
                         var toolCalls: [ProviderToolCall] = []
@@ -183,6 +187,13 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
                             throw AnthropicOAuthLanguageModelError.toolLoopLimitExceeded(rounds: rounds)
                         }
                     }
+                    // Everything the exchange added past the conversation it started
+                    // from: the tool calls and their results, in the order they went out.
+                    Self.streamedTurns.record(
+                        Array(messages.dropFirst(replayed.count)),
+                        for: session,
+                        at: responseIndex
+                    )
                     // A provider that ignored the response format and answered in prose
                     // is a failure worth reporting, not a stream that quietly says
                     // nothing.
@@ -243,15 +254,27 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
         }
     }
 
-    private static func buildMessages(from transcript: Transcript) throws -> [AnthropicRequest.Message] {
+    /// The conversation as it goes back on the wire.
+    ///
+    /// A response that was streamed with tools in play is put back as the messages that
+    /// turn actually sent — the assistant's calls, the results, then the answer — rather
+    /// than as the one plain assistant message the transcript remembers. Anything else
+    /// diverges from what the provider cached, and a prefix that diverges is re-read at
+    /// full price from that point on.
+    private static func buildMessages(from session: LanguageModelSession) throws -> [AnthropicRequest.Message] {
         var messages: [AnthropicRequest.Message] = []
-        for entry in transcript {
+        var responseIndex = 0
+        for entry in session.transcript {
             switch entry {
             case .instructions:
                 break
             case let .prompt(prompt):
                 messages.append(.init(role: "user", content: convertSegments(prompt.segments)))
             case let .response(response):
+                if let recorded = streamedTurns.messages(for: session, at: responseIndex) {
+                    messages.append(contentsOf: recorded)
+                }
+                responseIndex += 1
                 messages.append(.init(role: "assistant", content: convertSegments(response.segments)))
             case let .toolCalls(toolCalls):
                 let blocks = try toolCalls.map { call in

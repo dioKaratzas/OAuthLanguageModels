@@ -222,6 +222,80 @@ extension StreamedExchange {
         }
 
         @Test
+        func `A later Anthropic turn replays the tool round the first one sent`() async throws {
+            try await streamedConversation(
+                with: Self.anthropic(),
+                turns: [Anthropic.askingForTheTool, Anthropic.answeringWithIt, Anthropic.answeringWithIt],
+                tools: [WeatherTool(callCount: Counter())],
+                prompts: ["What is the weather in Athens?", "And tomorrow?"]
+            )
+            let followUp = try #require(Exchange.shared.requestBodies.last)
+
+            // The transcript remembers the answer and nothing of how it was reached, so
+            // without the record this turn would rebuild that exchange as one plain
+            // assistant message — and the provider's cached prefix diverges there.
+            #expect(followUp.contains(#""type":"tool_use""#))
+            #expect(followUp.contains(#""tool_use_id":"toolu_01""#))
+            #expect(followUp.contains("17C and clear."))
+        }
+
+        @Test
+        func `A later Anthropic turn is cached at the system block, the previous turn and the newest`() async throws {
+            try await streamedConversation(
+                with: Self.anthropic(),
+                turns: [Anthropic.askingForTheTool, Anthropic.answeringWithIt, Anthropic.answeringWithIt],
+                tools: [WeatherTool(callCount: Counter())],
+                prompts: ["What is the weather in Athens?", "And tomorrow?"]
+            )
+            let body = try #require(Self.decode(Exchange.shared.requestBodies.last).objectValue)
+            let system = try #require(body["system"]?.arrayValue)
+            let messages = try #require(body["messages"]?.arrayValue)
+
+            #expect(system.last?.objectValue?["cache_control"] != nil)
+            // Three anchors, one under the four Anthropic allows: a read walks back at
+            // most twenty blocks, so a turn that grew by more than that still lands on the
+            // previous turn's write instead of falling back to the system block.
+            #expect(Self.marked(messages.suffix(2)) == 2)
+            #expect(messages.count > 2)
+            #expect(Self.marked(messages.dropLast(2)) == 0)
+        }
+
+        @Test
+        func `A later Codex turn replays the function call the first one sent`() async throws {
+            try await streamedConversation(
+                with: Self.codex(),
+                turns: [Codex.askingForTheTool, Codex.answeringWithIt, Codex.answeringWithIt],
+                tools: [WeatherTool(callCount: Counter())],
+                prompts: ["What is the weather in Athens?", "And tomorrow?"]
+            )
+            let followUp = try #require(Exchange.shared.requestBodies.last)
+
+            #expect(followUp.contains(#""type":"function_call""#))
+            #expect(followUp.contains(#""type":"function_call_output""#))
+            #expect(followUp.contains(#""call_id":"call_01""#))
+            #expect(followUp.contains("17C and clear."))
+            // The reasoning the first turn replayed is part of that prefix too.
+            #expect(followUp.contains("gAAAAAB"))
+        }
+
+        @Test
+        func `Every Codex turn is cached under the same key`() async throws {
+            try await streamedConversation(
+                with: Self.codex(),
+                turns: [Codex.askingForTheTool, Codex.answeringWithIt, Codex.answeringWithIt],
+                tools: [WeatherTool(callCount: Counter())],
+                prompts: ["What is the weather in Athens?", "And tomorrow?"]
+            )
+            let keys = Exchange.shared.requestBodies.map(Self.promptCacheKey)
+
+            // A fresh key per turn would miss the cache on every question in a
+            // conversation, which is the one thing the key exists to prevent.
+            #expect(keys.count == 3)
+            #expect(Set(keys).count == 1)
+            #expect(keys.first??.isEmpty == false)
+        }
+
+        @Test
         func `A turn with no tools reports no calls`() async throws {
             let calls = ToolCalls()
             _ = try await streamedSnapshots(
@@ -391,6 +465,25 @@ extension StreamedExchange {
                 maxToolRounds: maxToolRounds,
                 onEvent: onEvent
             )
+        }
+
+        private static func decode(_ body: String?) -> JSONValue {
+            guard let body, let value = try? JSONDecoder().decode(JSONValue.self, from: Data(body.utf8)) else {
+                return .null
+            }
+            return value
+        }
+
+        /// How many of these messages carry a breakpoint on their last block.
+        private static func marked(_ messages: some Sequence<JSONValue>) -> Int {
+            messages.count { message in
+                message.objectValue?["content"]?.arrayValue?.last?.objectValue?["cache_control"] != nil
+            }
+        }
+
+        private static func promptCacheKey(_ body: String) -> String? {
+            let value = try? JSONDecoder().decode(JSONValue.self, from: Data(body.utf8))
+            return value?.objectValue?["prompt_cache_key"]?.stringValue
         }
 
         private static func expectOneContinuousAnswer(_ snapshots: [String]) {

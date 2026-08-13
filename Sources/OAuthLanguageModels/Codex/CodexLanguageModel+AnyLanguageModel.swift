@@ -16,7 +16,7 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
         let custom = options[custom: Self.self] ?? .init()
         let schema = try structuredSchema(for: type)
         let instructions = try Self.instructions(session, schema: schema, inPrompt: includeSchemaInPrompt)
-        var inputs = try await buildInputs(from: session.transcript)
+        var inputs = try await buildInputs(from: session)
         let tools = try session.tools.map(Self.convertTool)
         var entries: [Transcript.Entry] = []
         var rounds = 0
@@ -119,8 +119,12 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
                     let schema = try structuredSchema(for: type)
                     let instructions = try Self.instructions(session, schema: schema, inPrompt: includeSchemaInPrompt)
                     let tools = try session.tools.map(Self.convertTool)
-                    var inputs = try await buildInputs(from: session.transcript)
+                    let replayed = try await buildInputs(from: session)
+                    var inputs = replayed
                     var answer = StreamedAnswer<Content>(isStructured: schema != nil)
+                    // The response this turn becomes, so its tool rounds can be found
+                    // again when the next turn rebuilds the conversation.
+                    let responseIndex = session.transcript.responseCount
                     var wroteAnything = false
                     var hasOutput = false
                     var rounds = 0
@@ -183,6 +187,14 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
                         }
                     }
 
+                    // Everything the exchange added past the conversation it started
+                    // from: the replayed reasoning, the function calls and their output,
+                    // in the order they went out.
+                    Self.streamedTurns.record(
+                        Array(inputs.dropFirst(replayed.count)),
+                        for: session,
+                        at: responseIndex
+                    )
                     // A turn that produced neither text nor an output array produced
                     // nothing at all, which is worth an error rather than an empty stream
                     // the caller has to interpret.
@@ -265,15 +277,26 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
         return instructions + "\n\n" + sentence
     }
 
-    private func buildInputs(from transcript: Transcript) async throws -> [CodexInputItem] {
+    /// The conversation as it goes back on the wire.
+    ///
+    /// A response that was streamed with tools in play is put back as the items that turn
+    /// actually sent — the function calls, their output, and the reasoning to replay —
+    /// rather than as the one assistant message the transcript remembers. Anything else
+    /// diverges from what the provider cached under this session's `prompt_cache_key`.
+    private func buildInputs(from session: LanguageModelSession) async throws -> [CodexInputItem] {
         var input: [CodexInputItem] = []
-        for entry in transcript {
+        var responseIndex = 0
+        for entry in session.transcript {
             switch entry {
             case .instructions:
                 break
             case let .prompt(prompt):
                 input.append(Self.userMessage(from: prompt.segments))
             case let .response(response):
+                if let recorded = Self.streamedTurns.messages(for: session, at: responseIndex) {
+                    input.append(contentsOf: recorded)
+                }
+                responseIndex += 1
                 input.append(.assistantMessage(textSegments: Self.assistantTexts(from: response.segments)))
             case let .toolCalls(toolCalls):
                 for call in toolCalls {

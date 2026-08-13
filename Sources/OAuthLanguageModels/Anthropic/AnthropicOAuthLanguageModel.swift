@@ -96,6 +96,11 @@ public struct AnthropicOAuthLanguageModel: Sendable {
 
     // MARK: Internal
 
+    /// What each streamed tool-using turn put on the wire, so a later turn can replay it
+    /// exactly. Static and keyed by session, so rebuilding the model between turns of the
+    /// same conversation does not lose the record.
+    static let streamedTurns = StreamedTurnStore<AnthropicRequest.Message>()
+
     /// Top-level body keys that callers may not override via `extraBody`.
     /// These are required for the OAuth/Claude Code request shape.
     static let reservedBodyKeys: Set<String> = [
@@ -185,9 +190,7 @@ public struct AnthropicOAuthLanguageModel: Sendable {
         }
 
         var cachedMessages = messages
-        if !cachedMessages.isEmpty {
-            cachedMessages[cachedMessages.count - 1].markLastBlockCached(with: cacheControl)
-        }
+        cachedMessages.markCacheBreakpoints(with: cacheControl)
 
         let body = AnthropicRequest(
             model: model,
@@ -496,6 +499,22 @@ struct AnthropicRequest: Encodable {
     var toolChoice: ToolChoice?
     var thinking: Thinking?
     var outputConfig: OutputConfig?
+}
+
+extension [AnthropicRequest.Message] {
+    /// Puts the two message-level cache breakpoints where a growing conversation wants
+    /// them: on the newest block, and on the last block of the turn before it.
+    ///
+    /// Writes happen only at a breakpoint, and a read walks back at most twenty blocks
+    /// looking for one a previous request wrote. With the newest block alone, a
+    /// conversation that grows by more than twenty blocks between turns finds nothing and
+    /// re-reads from the system block; the second anchor is a write far enough back that
+    /// the walk still lands on it. Anthropic allows four, and the system block takes one.
+    mutating func markCacheBreakpoints(with cacheControl: AnthropicRequest.CacheControl) {
+        for index in indices.suffix(2) {
+            self[index].markLastBlockCached(with: cacheControl)
+        }
+    }
 }
 
 // MARK: - AnthropicTool

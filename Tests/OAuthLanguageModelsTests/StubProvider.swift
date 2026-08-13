@@ -265,3 +265,29 @@ func streamedStructured<Content: Generable>(
     }
     return snapshots
 }
+
+/// Runs several streamed turns against one session, so the conversation the second turn
+/// rebuilds is the one the first turn left behind.
+///
+/// Goes through the session rather than the model: it is the session that records a
+/// prompt and its answer in the transcript, and the transcript is what a later request is
+/// built from.
+func streamedConversation(
+    with model: some AnyLanguageModel.LanguageModel,
+    turns: [String],
+    tools: [any Tool],
+    prompts: [String]
+) async throws {
+    StubProtocol.install()
+    Exchange.shared.serve(turns)
+
+    let session = LanguageModelSession(model: model, tools: tools, transcript: Transcript())
+    for prompt in prompts {
+        for try await _ in session.streamResponse(
+            to: Prompt(prompt),
+            generating: String.self,
+            includeSchemaInPrompt: false,
+            options: GenerationOptions()
+        ) {}
+    }
+}
