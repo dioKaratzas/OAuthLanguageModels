@@ -248,13 +248,14 @@ public struct AnthropicOAuthLanguageModel: Sendable {
     func sendStream(
         messages: [AnthropicRequest.Message],
         instructions: String?,
+        tools: [AnthropicTool]?,
         parameters: AnthropicRequestParameters
     ) async throws -> AsyncThrowingStream<AnthropicStreamPart, any Error> {
         let request = try await makeRequest(
             streaming: true,
             messages: messages,
             instructions: instructions,
-            tools: nil,
+            tools: tools,
             parameters: parameters
         )
         let (bytes, response) = try await URLSession.shared.bytes(for: request)

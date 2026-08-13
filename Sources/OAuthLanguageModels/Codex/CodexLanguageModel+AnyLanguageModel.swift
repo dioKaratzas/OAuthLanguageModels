@@ -84,6 +84,17 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
         }
     }
 
+    /// The answer as it is written, running the tool loop as it goes.
+    ///
+    /// Each snapshot is the answer so far, and it keeps growing across tool rounds: a
+    /// caller appending the tail of every snapshot gets one continuous answer whether or
+    /// not tools were called in the middle of it.
+    ///
+    /// The tool calls and their outputs are not reported as transcript entries — a
+    /// `ResponseStream` has nowhere to put them — so a session that streams a tool-using
+    /// turn does not have that turn's calls in its transcript afterwards. Use
+    /// ``respond(within:to:generating:includeSchemaInPrompt:options:)`` where the
+    /// transcript has to be complete.
     public func streamResponse<Content: Generable>(
         within session: LanguageModelSession,
         to prompt: Prompt,
@@ -91,10 +102,9 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
         includeSchemaInPrompt: Bool,
         options: GenerationOptions
     ) -> sending LanguageModelSession.ResponseStream<Content> {
-        // Tools have to be reassembled from their argument fragments and then run, and a
-        // structured type is only decodable once it is whole. Both are answered in one
-        // piece; only plain text can be handed over as it arrives.
-        guard type == String.self, session.tools.isEmpty else {
+        // A structured type is only decodable once it is whole, so it cannot be handed
+        // over a piece at a time. Plain text can, tools or no tools.
+        guard type == String.self else {
             return wholeResponseAsStream(
                 within: session,
                 to: prompt,
@@ -108,25 +118,66 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
             let task = Task {
                 do {
                     let custom = options[custom: Self.self] ?? .init()
-                    let inputs = try await buildInputs(from: session.transcript)
+                    let tools = session.tools.map(Self.convertTool)
+                    var inputs = try await buildInputs(from: session.transcript)
                     var text = ""
-                    let parts = try await sendStream(
-                        inputs: inputs,
-                        instructions: session.instructions?.description,
-                        tools: nil,
-                        parameters: parameters(options: options, custom: custom)
-                    )
-                    for try await part in parts {
-                        // Reasoning and the terminal report reach the caller through the
-                        // model's `onEvent`; only the answer belongs in a snapshot.
-                        guard case let .text(delta) = part else { continue }
-                        text += delta
-                        // Snapshots are cumulative: each one is the answer so far, not the
-                        // piece that just landed.
-                        let content = text as! Content
-                        continuation.yield(
-                            .init(content: content.asPartiallyGenerated(), rawContent: GeneratedContent(text))
+
+                    while true {
+                        var toolCalls: [CodexToolCall] = []
+                        var reasoningItems: [CodexInputItem] = []
+
+                        let parts = try await sendStream(
+                            inputs: inputs,
+                            instructions: session.instructions?.description,
+                            tools: tools.isEmpty ? nil : tools,
+                            parameters: parameters(options: options, custom: custom)
                         )
+                        for try await part in parts {
+                            switch part {
+                            case let .text(delta):
+                                text += delta
+                                // Snapshots are cumulative across the whole exchange:
+                                // each one is the answer so far, tool rounds included.
+                                let content = text as! Content
+                                continuation.yield(
+                                    .init(content: content.asPartiallyGenerated(), rawContent: GeneratedContent(text))
+                                )
+                            case .reasoning:
+                                // Reasoning reaches the caller through the model's
+                                // `onEvent`, never as part of the answer.
+                                break
+                            case let .toolCall(call):
+                                toolCalls.append(call)
+                            case let .finished(response):
+                                reasoningItems = response.reasoningItems
+                            }
+                        }
+
+                        // Replayed in subsequent requests: `store: false` means the
+                        // provider keeps none of this turn's reasoning for the next one.
+                        inputs.append(contentsOf: reasoningItems)
+
+                        guard !toolCalls.isEmpty else { break }
+                        await state.remember(toolCalls)
+                        inputs.append(contentsOf: CodexInputItem.functionCalls(for: toolCalls))
+
+                        let providerCalls = toolCalls.compactMap { call -> ProviderToolCall? in
+                            guard let arguments = try? GeneratedContent(json: call.argumentsJSON) else { return nil }
+                            return ProviderToolCall(id: call.id, itemID: call.itemID, name: call.name, arguments: arguments)
+                        }
+                        guard case let .invocations(invocations) = try await resolveToolCalls(providerCalls, session: session),
+                              !invocations.isEmpty else {
+                            break
+                        }
+
+                        for invocation in invocations {
+                            inputs.append(
+                                .functionCallOutput(
+                                    callID: invocation.output.id,
+                                    output: Self.toolOutputString(invocation.output.segments)
+                                )
+                            )
+                        }
                     }
                     continuation.finish()
                 } catch {

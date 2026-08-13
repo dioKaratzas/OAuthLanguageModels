@@ -86,6 +86,17 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
         }
     }
 
+    /// The answer as it is written, running the tool loop as it goes.
+    ///
+    /// Each snapshot is the answer so far, and it keeps growing across tool rounds: a
+    /// caller appending the tail of every snapshot gets one continuous answer whether or
+    /// not tools were called in the middle of it.
+    ///
+    /// The tool calls and their outputs are not reported as transcript entries — a
+    /// `ResponseStream` has nowhere to put them — so a session that streams a tool-using
+    /// turn does not have that turn's calls in its transcript afterwards. Use
+    /// ``respond(within:to:generating:includeSchemaInPrompt:options:)`` where the
+    /// transcript has to be complete.
     public func streamResponse<Content: Generable>(
         within session: LanguageModelSession,
         to prompt: Prompt,
@@ -93,10 +104,9 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
         includeSchemaInPrompt: Bool,
         options: GenerationOptions
     ) -> sending LanguageModelSession.ResponseStream<Content> {
-        // Tools have to be reassembled from their argument fragments and then run, and
-        // a structured type is only decodable once it is whole. Both are answered in
-        // one piece; only plain text can be handed over as it arrives.
-        guard type == String.self, session.tools.isEmpty else {
+        // A structured type is only decodable once it is whole, so it cannot be handed
+        // over a piece at a time. Plain text can, tools or no tools.
+        guard type == String.self else {
             return wholeResponseAsStream(
                 within: session,
                 to: prompt,
@@ -110,23 +120,65 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
             let task = Task {
                 do {
                     let custom = options[custom: Self.self] ?? .init()
+                    let tools = try session.tools.map(Self.convertTool)
+                    var messages = try Self.buildMessages(from: session.transcript)
                     var text = ""
-                    let parts = try await sendStream(
-                        messages: try Self.buildMessages(from: session.transcript),
-                        instructions: session.instructions?.description,
-                        parameters: parameters(options: options, custom: custom)
-                    )
-                    for try await part in parts {
-                        // Reasoning and the terminal report reach the caller through the
-                        // model's `onEvent`; only the answer belongs in a snapshot.
-                        guard case let .text(delta) = part else { continue }
-                        text += delta
-                        // Snapshots are cumulative: each one is the answer so far, not
-                        // the piece that just landed.
-                        let content = text as! Content
-                        continuation.yield(
-                            .init(content: content.asPartiallyGenerated(), rawContent: GeneratedContent(text))
+
+                    while true {
+                        var toolCalls: [ProviderToolCall] = []
+                        var turn: [AnthropicResponse.ContentBlock] = []
+
+                        let parts = try await sendStream(
+                            messages: messages,
+                            instructions: session.instructions?.description,
+                            tools: tools.isEmpty ? nil : tools,
+                            parameters: parameters(options: options, custom: custom)
                         )
+                        for try await part in parts {
+                            switch part {
+                            case let .text(delta):
+                                text += delta
+                                // Snapshots are cumulative across the whole exchange:
+                                // each one is the answer so far, tool rounds included.
+                                let content = text as! Content
+                                continuation.yield(
+                                    .init(content: content.asPartiallyGenerated(), rawContent: GeneratedContent(text))
+                                )
+                            case .thinking:
+                                // Reasoning reaches the caller through the model's
+                                // `onEvent`, never as part of the answer.
+                                break
+                            case let .toolUse(use):
+                                if let call = Self.providerCall(for: use) {
+                                    toolCalls.append(call)
+                                }
+                            case let .finished(content, _):
+                                turn = content
+                            }
+                        }
+
+                        guard !toolCalls.isEmpty else { break }
+                        guard case let .invocations(invocations) = try await resolveToolCalls(toolCalls, session: session),
+                              !invocations.isEmpty else {
+                            break
+                        }
+
+                        messages.append(.init(role: "assistant", content: turn))
+                        for invocation in invocations {
+                            messages.append(
+                                .init(
+                                    role: "user",
+                                    content: [
+                                        .toolResult(
+                                            .init(
+                                                toolUseID: invocation.call.id,
+                                                content: Self.convertSegments(invocation.output.segments)
+                                            )
+                                        )
+                                    ]
+                                )
+                            )
+                        }
                     }
                     continuation.finish()
                 } catch {
