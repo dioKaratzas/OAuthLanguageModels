@@ -108,7 +108,11 @@ public struct AnthropicOAuthLanguageModel: Sendable {
 
         let value = try JSONDecoder().decode(JSONValue.self, from: baseData)
         guard case var .object(object) = value else { return baseData }
-        for (key, value) in extra where !reservedBodyKeys.contains(key) {
+        for (key, value) in extra {
+            guard !reservedBodyKeys.contains(key) else {
+                logDropped("body key", name: key, from: "extraBody")
+                continue
+            }
             object[key] = value
         }
         return try JSONEncoder.deterministic.encode(JSONValue.object(object))
@@ -140,7 +144,11 @@ public struct AnthropicOAuthLanguageModel: Sendable {
         request.setValue("cli", forHTTPHeaderField: "x-app")
         request.setValue(streaming ? "text/event-stream" : "application/json", forHTTPHeaderField: "accept")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
-        for (field, value) in extraHeaders where !Self.reservedHeaderFields.contains(field.lowercased()) {
+        for (field, value) in extraHeaders {
+            guard !Self.reservedHeaderFields.contains(field.lowercased()) else {
+                logDropped("header field", name: field, from: "extraHeaders")
+                continue
+            }
             request.setValue(value, forHTTPHeaderField: field)
         }
 

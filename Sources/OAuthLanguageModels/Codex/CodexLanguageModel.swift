@@ -217,10 +217,12 @@ public struct CodexLanguageModel: Sendable {
 
         body["tool_choice"] = parameters.toolChoice ?? .string("auto")
 
-        if let extra = parameters.extraBody {
-            for (key, value) in extra where !reservedBodyKeys.contains(key) {
-                body[key] = value
+        for (key, value) in parameters.extraBody ?? [:] {
+            guard !reservedBodyKeys.contains(key) else {
+                logDropped("body key", name: key, from: "extraBody")
+                continue
             }
+            body[key] = value
         }
 
         return .object(body)
