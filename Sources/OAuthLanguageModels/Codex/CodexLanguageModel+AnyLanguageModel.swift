@@ -10,25 +10,23 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
         within session: LanguageModelSession,
         to _: Prompt,
         generating type: Content.Type,
-        includeSchemaInPrompt _: Bool,
+        includeSchemaInPrompt: Bool,
         options: GenerationOptions
     ) async throws -> LanguageModelSession.Response<Content> {
-        guard type == String.self else {
-            throw CodexLanguageModelError.unsupportedContentType
-        }
-
         let custom = options[custom: Self.self] ?? .init()
+        let schema = try structuredSchema(for: type)
+        let instructions = try Self.instructions(session, schema: schema, inPrompt: includeSchemaInPrompt)
         var inputs = try await buildInputs(from: session.transcript)
-        let tools = session.tools.map(Self.convertTool)
+        let tools = try session.tools.map(Self.convertTool)
         var entries: [Transcript.Entry] = []
         var rounds = 0
 
         while true {
             let response = try await send(
                 inputs: inputs,
-                instructions: session.instructions?.description,
+                instructions: instructions,
                 tools: tools.isEmpty ? nil : tools,
-                parameters: parameters(options: options, custom: custom)
+                parameters: parameters(options: options, custom: custom, schema: schema, type: type)
             )
 
             // Replay reasoning items in subsequent requests within this loop.
@@ -39,10 +37,7 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
                 await state.remember(toolCalls)
                 inputs.append(contentsOf: CodexInputItem.functionCalls(for: toolCalls))
 
-                let providerCalls = toolCalls.compactMap { call -> ProviderToolCall? in
-                    guard let arguments = try? GeneratedContent(json: call.argumentsJSON) else { return nil }
-                    return ProviderToolCall(id: call.id, itemID: call.itemID, name: call.name, arguments: arguments)
-                }
+                let providerCalls = try toolCalls.map(Self.providerCall(for:))
 
                 let resolution = try await resolveToolCalls(providerCalls, session: session)
                 switch resolution {
@@ -81,9 +76,10 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
             guard text.isEmpty == false || response.hasOutput else {
                 throw CodexLanguageModelError.noResponseGenerated
             }
+            let answer = try finishedContent(text, as: type)
             return LanguageModelSession.Response(
-                content: text as! Content,
-                rawContent: GeneratedContent(text),
+                content: answer.content,
+                rawContent: answer.rawContent,
                 transcriptEntries: ArraySlice(entries)
             )
         }
@@ -105,55 +101,48 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
     /// already been written: a snapshot the caller has been shown cannot be withdrawn, so
     /// the answer stands as far as it got rather than being replaced by an empty one the
     /// way ``respond(within:to:generating:includeSchemaInPrompt:options:)`` does.
+    ///
+    /// A structured type streams too. The provider writes the JSON as ordinary assistant
+    /// text, and a JSON document is readable at every step of being written: each
+    /// snapshot carries the fields that have arrived and leaves the rest nil.
     public func streamResponse<Content: Generable>(
         within session: LanguageModelSession,
-        to prompt: Prompt,
+        to _: Prompt,
         generating type: Content.Type,
         includeSchemaInPrompt: Bool,
         options: GenerationOptions
     ) -> sending LanguageModelSession.ResponseStream<Content> {
-        // A structured type is only decodable once it is whole, so it cannot be handed
-        // over a piece at a time. Plain text can, tools or no tools.
-        guard type == String.self else {
-            return wholeResponseAsStream(
-                within: session,
-                to: prompt,
-                generating: type,
-                includeSchemaInPrompt: includeSchemaInPrompt,
-                options: options
-            )
-        }
-
         let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init { continuation in
             let task = Task {
                 do {
                     let custom = options[custom: Self.self] ?? .init()
-                    let tools = session.tools.map(Self.convertTool)
+                    let schema = try structuredSchema(for: type)
+                    let instructions = try Self.instructions(session, schema: schema, inPrompt: includeSchemaInPrompt)
+                    let tools = try session.tools.map(Self.convertTool)
                     var inputs = try await buildInputs(from: session.transcript)
-                    var text = ""
+                    var answer = StreamedAnswer<Content>(isStructured: schema != nil)
+                    var wroteAnything = false
                     var hasOutput = false
                     var rounds = 0
 
                     while true {
                         var toolCalls: [CodexToolCall] = []
                         var reasoningItems: [CodexInputItem] = []
+                        answer.startTurn()
 
                         let parts = try await sendStream(
                             inputs: inputs,
-                            instructions: session.instructions?.description,
+                            instructions: instructions,
                             tools: tools.isEmpty ? nil : tools,
-                            parameters: parameters(options: options, custom: custom)
+                            parameters: parameters(options: options, custom: custom, schema: schema, type: type)
                         )
                         for try await part in parts {
                             switch part {
                             case let .text(delta):
-                                text += delta
-                                // Snapshots are cumulative across the whole exchange:
-                                // each one is the answer so far, tool rounds included.
-                                let content = text as! Content
-                                continuation.yield(
-                                    .init(content: content.asPartiallyGenerated(), rawContent: GeneratedContent(text))
-                                )
+                                wroteAnything = true
+                                if let snapshot = try answer.append(delta) {
+                                    continuation.yield(snapshot)
+                                }
                             case .reasoning:
                                 // Reasoning reaches the caller through the model's
                                 // `onEvent`, never as part of the answer.
@@ -174,10 +163,7 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
                         await state.remember(toolCalls)
                         inputs.append(contentsOf: CodexInputItem.functionCalls(for: toolCalls))
 
-                        let providerCalls = toolCalls.compactMap { call -> ProviderToolCall? in
-                            guard let arguments = try? GeneratedContent(json: call.argumentsJSON) else { return nil }
-                            return ProviderToolCall(id: call.id, itemID: call.itemID, name: call.name, arguments: arguments)
-                        }
+                        let providerCalls = try toolCalls.map(Self.providerCall(for:))
                         guard case let .invocations(invocations) = try await resolveToolCalls(providerCalls, session: session),
                               !invocations.isEmpty else {
                             break
@@ -200,38 +186,13 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
                     // A turn that produced neither text nor an output array produced
                     // nothing at all, which is worth an error rather than an empty stream
                     // the caller has to interpret.
-                    guard !text.isEmpty || hasOutput else {
+                    guard wroteAnything || hasOutput else {
                         throw CodexLanguageModelError.noResponseGenerated
                     }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
-
-        return LanguageModelSession.ResponseStream(stream: stream)
-    }
-
-    private func wholeResponseAsStream<Content: Generable>(
-        within session: LanguageModelSession,
-        to prompt: Prompt,
-        generating type: Content.Type,
-        includeSchemaInPrompt: Bool,
-        options: GenerationOptions
-    ) -> sending LanguageModelSession.ResponseStream<Content> {
-        let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init { continuation in
-            let task = Task {
-                do {
-                    let response = try await respond(
-                        within: session,
-                        to: prompt,
-                        generating: type,
-                        includeSchemaInPrompt: includeSchemaInPrompt,
-                        options: options
-                    )
-                    continuation.yield(.init(content: response.content.asPartiallyGenerated(), rawContent: response.rawContent))
+                    // A provider that ignored the response format and answered in prose
+                    // is a failure worth reporting, not a stream that quietly says
+                    // nothing.
+                    try answer.checkFinished()
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -245,9 +206,11 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
 
     // MARK: Private
 
-    private func parameters(
+    private func parameters<Content: Generable>(
         options: GenerationOptions,
-        custom: CustomGenerationOptions
+        custom: CustomGenerationOptions,
+        schema: JSONValue?,
+        type: Content.Type
     ) -> CodexRequestParameters {
         CodexRequestParameters(
             temperature: options.temperature,
@@ -259,8 +222,40 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
             reasoningEffort: custom.reasoning?.effort?.rawValue,
             reasoningSummary: custom.reasoning?.summary?.rawValue,
             toolChoice: custom.toolChoice.map(Self.toolChoiceJSON),
+            responseFormat: schema.map { Self.responseFormat($0, named: Self.schemaName(for: type)) },
             extraBody: custom.extraBody
         )
+    }
+
+    /// The Responses API's `text.format`, which needs a name for the schema as well as
+    /// the schema itself.
+    private static func responseFormat(_ schema: JSONValue, named name: String) -> JSONValue {
+        .object([
+            "type": .string("json_schema"),
+            "name": .string(name),
+            "schema": schema,
+            "strict": .bool(true)
+        ])
+    }
+
+    /// The type's own name, reduced to what the API accepts as a schema name.
+    private static func schemaName<Content: Generable>(for type: Content.Type) -> String {
+        let name = String(describing: type).filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
+        return name.isEmpty ? "Response" : name
+    }
+
+    /// The session's own instructions, with the schema appended where the caller asked
+    /// for it in the prompt as well as in `text.format`.
+    private static func instructions(
+        _ session: LanguageModelSession,
+        schema: JSONValue?,
+        inPrompt: Bool
+    ) throws -> String? {
+        let instructions = session.instructions?.description
+        guard inPrompt, let schema else { return instructions }
+        let sentence = try schemaInstruction(schema)
+        guard let instructions, !instructions.isEmpty else { return sentence }
+        return instructions + "\n\n" + sentence
     }
 
     private func buildInputs(from transcript: Transcript) async throws -> [CodexInputItem] {
@@ -307,8 +302,21 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
         }
     }
 
-    private static func convertTool(_ tool: any Tool) -> OpenResponsesTool {
-        makeOpenResponsesTool(name: tool.name, description: tool.description, schema: tool.parameters)
+    /// A model-issued call, as the resolver takes one.
+    ///
+    /// Throws where the arguments will not parse. Dropping such a call instead would
+    /// leave the model waiting on a result for something nobody ran.
+    private static func providerCall(for call: CodexToolCall) throws -> ProviderToolCall {
+        try ProviderToolCall(
+            id: call.id,
+            itemID: call.itemID,
+            name: call.name,
+            arguments: GeneratedContent(json: call.argumentsJSON)
+        )
+    }
+
+    private static func convertTool(_ tool: any Tool) throws -> OpenResponsesTool {
+        try makeOpenResponsesTool(name: tool.name, description: tool.description, schema: tool.parameters)
     }
 
     private static func userMessage(from segments: [Transcript.Segment]) -> CodexInputItem {

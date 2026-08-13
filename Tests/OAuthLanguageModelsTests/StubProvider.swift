@@ -215,3 +215,28 @@ func streamedSnapshots(
     }
     return snapshots
 }
+
+/// Runs a whole streamed exchange against `turns`, and hands back every partially
+/// generated value the caller would have seen.
+func streamedStructured<Content: Generable>(
+    from model: some AnyLanguageModel.LanguageModel,
+    turns: [String],
+    tools: [any Tool] = [],
+    generating type: Content.Type
+) async throws -> [Content.PartiallyGenerated] where Content.PartiallyGenerated: Sendable {
+    StubProtocol.install()
+    Exchange.shared.serve(turns)
+
+    let session = LanguageModelSession(model: model, tools: tools, transcript: Transcript())
+    var snapshots: [Content.PartiallyGenerated] = []
+    for try await snapshot in model.streamResponse(
+        within: session,
+        to: Prompt("What is the weather in Athens?"),
+        generating: type,
+        includeSchemaInPrompt: false,
+        options: GenerationOptions()
+    ) {
+        snapshots.append(snapshot.content)
+    }
+    return snapshots
+}

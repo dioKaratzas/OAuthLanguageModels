@@ -200,7 +200,8 @@ public struct AnthropicOAuthLanguageModel: Sendable {
             topK: parameters.topK,
             stopSequences: parameters.stopSequences,
             toolChoice: parameters.toolChoice,
-            thinking: parameters.thinkingBudgetTokens.map { .init(budgetTokens: $0) }
+            thinking: parameters.thinkingBudgetTokens.map { .init(budgetTokens: $0) },
+            outputConfig: parameters.responseFormat.map { .init(format: $0) }
         )
         request.httpBody = try Self.encodeBody(body, mergingExtraBody: parameters.extraBody)
         return request
@@ -354,6 +355,9 @@ struct AnthropicRequestParameters {
     var stopSequences: [String]?
     var toolChoice: AnthropicRequest.ToolChoice?
     var thinkingBudgetTokens: Int?
+    /// The JSON Schema the answer has to match, as `output_config.format`. Nil for a
+    /// plain-text turn.
+    var responseFormat: JSONValue?
     var extraBody: [String: JSONValue]?
 }
 
@@ -442,6 +446,12 @@ struct AnthropicRequest: Encodable {
         private enum CodingKeys: String, CodingKey { case type, name }
     }
 
+    /// Where the answer's own shape is asked for, beside the effort a caller may set
+    /// through `extraBody`. Merging keeps both.
+    struct OutputConfig: Encodable {
+        let format: JSONValue
+    }
+
     struct Thinking: Encodable {
         // MARK: Lifecycle
 
@@ -468,6 +478,7 @@ struct AnthropicRequest: Encodable {
     var stopSequences: [String]?
     var toolChoice: ToolChoice?
     var thinking: Thinking?
+    var outputConfig: OutputConfig?
 }
 
 // MARK: - AnthropicTool
@@ -661,8 +672,11 @@ struct AnthropicResponse: Decodable, Sendable {
 
 extension AnthropicResponse.ToolUse {
     /// Tool-call arguments serialized as a JSON object string.
-    var argumentsJSONString: String {
-        (try? jsonObjectString(from: input ?? [:])) ?? "{}"
+    ///
+    /// Throws where they will not serialize. Standing in an empty object instead would
+    /// run the tool with no arguments and call that the model's intent.
+    func argumentsJSONString() throws -> String {
+        try jsonObjectString(from: input ?? [:])
     }
 }
 

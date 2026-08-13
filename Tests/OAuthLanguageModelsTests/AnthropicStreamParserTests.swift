@@ -181,7 +181,7 @@ struct AnthropicStreamParserTests {
         #expect(parts.toolUses.count == 1)
         // Six fragments went in; a caller must never see the half of one that parses as
         // nothing, so the call surfaces only once its arguments close.
-        #expect(parts.toolUses.first?.argumentsJSONString == #"{"location":"San Francisco, CA"}"#)
+        #expect(try parts.toolUses.first?.argumentsJSONString() == #"{"location":"San Francisco, CA"}"#)
         #expect(parts.toolUses.first?.name == "get_weather")
         #expect(parts.toolUses.first?.id == "toolu_01")
     }

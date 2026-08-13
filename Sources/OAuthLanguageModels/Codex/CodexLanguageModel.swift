@@ -179,6 +179,11 @@ public struct CodexLanguageModel: Sendable {
         let verbosity = parameters.verbosity ?? "medium"
         let parallel = parameters.parallelToolCalls ?? true
 
+        var textObject: [String: JSONValue] = ["verbosity": .string(verbosity)]
+        if let format = parameters.responseFormat {
+            textObject["format"] = format
+        }
+
         var body: [String: JSONValue] = [
             "model": .string(model),
             "instructions": .string(instructions),
@@ -186,7 +191,7 @@ public struct CodexLanguageModel: Sendable {
             "prompt_cache_key": .string(promptCacheKey),
             "store": .bool(false),
             "stream": .bool(true),
-            "text": .object(["verbosity": .string(verbosity)]),
+            "text": .object(textObject),
             "include": .array([.string("reasoning.encrypted_content")]),
             "parallel_tool_calls": .bool(parallel)
         ]
@@ -254,15 +259,16 @@ public struct CodexLanguageModel: Sendable {
         return instructions
     }
 
+    /// The responses endpoint under whatever the caller gave as a base.
+    ///
+    /// Built by appending path components rather than by pasting strings together and
+    /// parsing them again: appending cannot fail, so a base URL the caller chose can
+    /// never take the process down.
     private func resolveCodexURL(from baseURL: URL) -> URL {
-        let trimmed = baseURL.absoluteString.replacingOccurrences(of: #"/+$"#, with: "", options: .regularExpression)
-        if trimmed.hasSuffix("/codex/responses") {
-            return URL(string: trimmed)!
-        }
-        if trimmed.hasSuffix("/codex") {
-            return URL(string: trimmed + "/responses")!
-        }
-        return URL(string: trimmed + "/codex/responses")!
+        let path = baseURL.path.replacingOccurrences(of: #"/+$"#, with: "", options: .regularExpression)
+        if path.hasSuffix("/codex/responses") { return baseURL }
+        if path.hasSuffix("/codex") { return baseURL.appendingPathComponent("responses") }
+        return baseURL.appendingPathComponent("codex").appendingPathComponent("responses")
     }
 
     /// Sends the request and hands back the response body, having already turned a
@@ -357,6 +363,9 @@ struct CodexRequestParameters {
     var reasoningSummary: String?
     /// Pre-rendered `tool_choice` value (defaults to `"auto"` when nil).
     var toolChoice: JSONValue?
+    /// The JSON Schema the answer has to match, as `text.format`. Nil for a plain-text
+    /// turn.
+    var responseFormat: JSONValue?
     var extraBody: [String: JSONValue]?
 }
 
@@ -474,8 +483,12 @@ struct OpenResponsesTool {
 }
 
 /// Builds an `OpenResponsesTool` from any encodable schema.
-func makeOpenResponsesTool(name: String, description: String, schema: some Encodable) -> OpenResponsesTool {
-    let parameters = try? providerToolSchemaJSONValue(forEncodableSchema: schema)
+///
+/// Throws where the schema will not encode. Sending the tool without its parameters
+/// instead would offer the model a tool it cannot call correctly, and nothing would say
+/// why the calls come back wrong.
+func makeOpenResponsesTool(name: String, description: String, schema: some Encodable) throws -> OpenResponsesTool {
+    let parameters = try providerToolSchemaJSONValue(forEncodableSchema: schema)
     return OpenResponsesTool(name: name, description: description, parameters: parameters)
 }
 

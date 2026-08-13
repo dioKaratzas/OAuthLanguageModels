@@ -10,14 +10,12 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
         within session: LanguageModelSession,
         to _: Prompt,
         generating type: Content.Type,
-        includeSchemaInPrompt _: Bool,
+        includeSchemaInPrompt: Bool,
         options: GenerationOptions
     ) async throws -> LanguageModelSession.Response<Content> {
-        guard type == String.self else {
-            throw AnthropicOAuthLanguageModelError.unsupportedContentType
-        }
-
         let custom = options[custom: Self.self] ?? .init()
+        let schema = try structuredSchema(for: type)
+        let instructions = try Self.instructions(session, schema: schema, inPrompt: includeSchemaInPrompt)
         var messages = try Self.buildMessages(from: session.transcript)
         let tools = try session.tools.map(Self.convertTool)
         var entries: [Transcript.Entry] = []
@@ -26,14 +24,14 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
         while true {
             let payload = try await send(
                 messages: messages,
-                instructions: session.instructions?.description,
+                instructions: instructions,
                 tools: tools.isEmpty ? nil : tools,
-                parameters: parameters(options: options, custom: custom)
+                parameters: parameters(options: options, custom: custom, schema: schema)
             )
 
-            let toolCalls = payload.content.compactMap { block -> ProviderToolCall? in
+            let toolCalls = try payload.content.compactMap { block -> ProviderToolCall? in
                 guard case let .toolUse(use) = block else { return nil }
-                return Self.providerCall(for: use)
+                return try Self.providerCall(for: use)
             }
 
             if !toolCalls.isEmpty {
@@ -82,10 +80,11 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
                 if case let .text(text) = block { return text.text }
                 return nil
             }.joined()
+            let answer = try finishedContent(text, as: type)
 
             return LanguageModelSession.Response(
-                content: text as! Content,
-                rawContent: GeneratedContent(text),
+                content: answer.content,
+                rawContent: answer.rawContent,
                 transcriptEntries: ArraySlice(entries)
             )
         }
@@ -107,62 +106,51 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
     /// already been written: a snapshot the caller has been shown cannot be withdrawn, so
     /// the answer stands as far as it got rather than being replaced by an empty one the
     /// way ``respond(within:to:generating:includeSchemaInPrompt:options:)`` does.
+    ///
+    /// A structured type streams too. The provider writes the JSON as ordinary assistant
+    /// text, and a JSON document is readable at every step of being written: each
+    /// snapshot carries the fields that have arrived and leaves the rest nil.
     public func streamResponse<Content: Generable>(
         within session: LanguageModelSession,
-        to prompt: Prompt,
+        to _: Prompt,
         generating type: Content.Type,
         includeSchemaInPrompt: Bool,
         options: GenerationOptions
     ) -> sending LanguageModelSession.ResponseStream<Content> {
-        // A structured type is only decodable once it is whole, so it cannot be handed
-        // over a piece at a time. Plain text can, tools or no tools.
-        guard type == String.self else {
-            return wholeResponseAsStream(
-                within: session,
-                to: prompt,
-                generating: type,
-                includeSchemaInPrompt: includeSchemaInPrompt,
-                options: options
-            )
-        }
-
         let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init { continuation in
             let task = Task {
                 do {
                     let custom = options[custom: Self.self] ?? .init()
+                    let schema = try structuredSchema(for: type)
+                    let instructions = try Self.instructions(session, schema: schema, inPrompt: includeSchemaInPrompt)
                     let tools = try session.tools.map(Self.convertTool)
                     var messages = try Self.buildMessages(from: session.transcript)
-                    var text = ""
+                    var answer = StreamedAnswer<Content>(isStructured: schema != nil)
                     var rounds = 0
 
                     while true {
                         var toolCalls: [ProviderToolCall] = []
                         var turn: [AnthropicResponse.ContentBlock] = []
+                        answer.startTurn()
 
                         let parts = try await sendStream(
                             messages: messages,
-                            instructions: session.instructions?.description,
+                            instructions: instructions,
                             tools: tools.isEmpty ? nil : tools,
-                            parameters: parameters(options: options, custom: custom)
+                            parameters: parameters(options: options, custom: custom, schema: schema)
                         )
                         for try await part in parts {
                             switch part {
                             case let .text(delta):
-                                text += delta
-                                // Snapshots are cumulative across the whole exchange:
-                                // each one is the answer so far, tool rounds included.
-                                let content = text as! Content
-                                continuation.yield(
-                                    .init(content: content.asPartiallyGenerated(), rawContent: GeneratedContent(text))
-                                )
+                                if let snapshot = try answer.append(delta) {
+                                    continuation.yield(snapshot)
+                                }
                             case .thinking:
                                 // Reasoning reaches the caller through the model's
                                 // `onEvent`, never as part of the answer.
                                 break
                             case let .toolUse(use):
-                                if let call = Self.providerCall(for: use) {
-                                    toolCalls.append(call)
-                                }
+                                toolCalls.append(try Self.providerCall(for: use))
                             case let .finished(content, _):
                                 turn = content
                             }
@@ -195,34 +183,10 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
                             throw AnthropicOAuthLanguageModelError.toolLoopLimitExceeded(rounds: rounds)
                         }
                     }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
-        return LanguageModelSession.ResponseStream(stream: stream)
-    }
-
-    private func wholeResponseAsStream<Content: Generable>(
-        within session: LanguageModelSession,
-        to prompt: Prompt,
-        generating type: Content.Type,
-        includeSchemaInPrompt: Bool,
-        options: GenerationOptions
-    ) -> sending LanguageModelSession.ResponseStream<Content> {
-        let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init { continuation in
-            let task = Task {
-                do {
-                    let response = try await respond(
-                        within: session,
-                        to: prompt,
-                        generating: type,
-                        includeSchemaInPrompt: includeSchemaInPrompt,
-                        options: options
-                    )
-                    continuation.yield(.init(content: response.content.asPartiallyGenerated(), rawContent: response.rawContent))
+                    // A provider that ignored the response format and answered in prose
+                    // is a failure worth reporting, not a stream that quietly says
+                    // nothing.
+                    try answer.checkFinished()
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -237,7 +201,8 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
 
     private func parameters(
         options: GenerationOptions,
-        custom: CustomGenerationOptions
+        custom: CustomGenerationOptions,
+        schema: JSONValue?
     ) -> AnthropicRequestParameters {
         AnthropicRequestParameters(
             // Anthropic requires temperature == 1 when extended thinking is on.
@@ -248,8 +213,23 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
             stopSequences: custom.stopSequences,
             toolChoice: custom.toolChoice.map(Self.toolChoice(from:)),
             thinkingBudgetTokens: custom.thinking?.budgetTokens,
+            responseFormat: schema.map { .object(["type": .string("json_schema"), "schema": $0]) },
             extraBody: custom.extraBody
         )
+    }
+
+    /// The session's own instructions, with the schema appended where the caller asked
+    /// for it in the prompt as well as in `output_config.format`.
+    private static func instructions(
+        _ session: LanguageModelSession,
+        schema: JSONValue?,
+        inPrompt: Bool
+    ) throws -> String? {
+        let instructions = session.instructions?.description
+        guard inPrompt, let schema else { return instructions }
+        let sentence = try schemaInstruction(schema)
+        guard let instructions, !instructions.isEmpty else { return sentence }
+        return instructions + "\n\n" + sentence
     }
 
     private static func toolChoice(
@@ -321,9 +301,17 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
         }
     }
 
-    private static func providerCall(for use: AnthropicResponse.ToolUse) -> ProviderToolCall? {
-        guard let arguments = try? GeneratedContent(json: use.argumentsJSONString) else { return nil }
-        return ProviderToolCall(id: use.id, itemID: use.id, name: use.name, arguments: arguments)
+    /// A model-issued call, as the resolver takes one.
+    ///
+    /// Throws where the arguments will not parse. Dropping such a call instead would
+    /// leave the model waiting on a result for something nobody ran.
+    private static func providerCall(for use: AnthropicResponse.ToolUse) throws -> ProviderToolCall {
+        try ProviderToolCall(
+            id: use.id,
+            itemID: use.id,
+            name: use.name,
+            arguments: GeneratedContent(json: try use.argumentsJSONString())
+        )
     }
 
     private static func convertTool(_ tool: any Tool) throws -> AnthropicTool {

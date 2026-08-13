@@ -63,7 +63,7 @@ import FoundationModels
                             action: .toolCall(
                                 id: use.id,
                                 name: use.name,
-                                action: .appendArguments(use.argumentsJSONString, tokenCount: 0)
+                                action: .appendArguments(try use.argumentsJSONString(), tokenCount: 0)
                             )
                         )
                     )

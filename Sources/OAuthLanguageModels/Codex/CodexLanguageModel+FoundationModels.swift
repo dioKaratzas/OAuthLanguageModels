@@ -34,8 +34,8 @@ import FoundationModels
             model: CodexLanguageModel,
             streamingInto channel: LanguageModelExecutorGenerationChannel
         ) async throws {
-            let tools = request.enabledToolDefinitions.map {
-                makeOpenResponsesTool(name: $0.name, description: $0.description, schema: $0.parameters)
+            let tools = try request.enabledToolDefinitions.map {
+                try makeOpenResponsesTool(name: $0.name, description: $0.description, schema: $0.parameters)
             }
 
             // One turn, streamed: the framework runs the tools itself and calls back with
