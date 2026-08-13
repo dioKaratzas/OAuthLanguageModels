@@ -1,3 +1,4 @@
+import AnyLanguageModel
 import Foundation
 
 /// Shared HTTP-body encoders/decoders for provider clients. Both Codex and
@@ -32,6 +33,28 @@ extension JSONDecoder {
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         return decoder
     }()
+}
+
+extension JSONValue {
+    var stringValue: String? {
+        if case let .string(string) = self { string } else { nil }
+    }
+
+    var intValue: Int? {
+        switch self {
+        case let .int(int): int
+        case let .double(double): Int(double)
+        default: nil
+        }
+    }
+
+    var objectValue: [String: JSONValue]? {
+        if case let .object(object) = self { object } else { nil }
+    }
+
+    var arrayValue: [JSONValue]? {
+        if case let .array(array) = self { array } else { nil }
+    }
 }
 
 // MARK: - DynamicCodingKey

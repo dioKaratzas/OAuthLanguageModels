@@ -363,16 +363,31 @@ struct AnthropicRequest: Encodable {
         let role: String
         var content: [AnthropicResponse.ContentBlock]
 
+        /// Puts the cache breakpoint on the last block that can hold one.
+        ///
+        /// Every block type but thinking accepts `cache_control`; a thinking block is
+        /// refused one and is cached implicitly with the turn around it, so the walk
+        /// steps back past it rather than leaving the whole conversation behind this
+        /// message to be re-read at full price on the next turn.
         mutating func markLastBlockCached(with cacheControl: CacheControl) {
             for index in content.indices.reversed() {
                 switch content[index] {
                 case var .text(text):
                     text.cacheControl = cacheControl
                     content[index] = .text(text)
-                    return
-                case .image, .toolUse, .toolResult, .thinking, .redactedThinking:
+                case var .image(image):
+                    image.cacheControl = cacheControl
+                    content[index] = .image(image)
+                case var .toolUse(toolUse):
+                    toolUse.cacheControl = cacheControl
+                    content[index] = .toolUse(toolUse)
+                case var .toolResult(toolResult):
+                    toolResult.cacheControl = cacheControl
+                    content[index] = .toolResult(toolResult)
+                case .thinking, .redactedThinking:
                     continue
                 }
+                return
             }
         }
     }
@@ -575,6 +590,7 @@ struct AnthropicResponse: Decodable {
 
         let type: String
         let source: Source
+        var cacheControl: AnthropicRequest.CacheControl?
     }
 
     struct ToolUse: Codable {
@@ -593,6 +609,7 @@ struct AnthropicResponse: Decodable {
         let id: String
         let name: String
         let input: [String: JSONValue]?
+        var cacheControl: AnthropicRequest.CacheControl?
     }
 
     struct ToolResult: Codable {
@@ -610,11 +627,13 @@ struct AnthropicResponse: Decodable {
             case type
             case toolUseID = "tool_use_id"
             case content
+            case cacheControl = "cache_control"
         }
 
         let type: String
         let toolUseID: String
         let content: [ContentBlock]
+        var cacheControl: AnthropicRequest.CacheControl?
     }
 
     let content: [ContentBlock]
