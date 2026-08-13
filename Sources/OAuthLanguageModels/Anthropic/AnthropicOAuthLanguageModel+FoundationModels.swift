@@ -67,9 +67,10 @@ import FoundationModels
                             )
                         )
                     )
-                case .thinking, .finished:
-                    // Reasoning and the turn report reach the caller through the model's
-                    // `onEvent`; the channel carries the answer only.
+                case .started, .thinking, .finished:
+                    // The opening count, the reasoning and the turn report reach the
+                    // caller through the model's `onEvent`; the channel carries the
+                    // answer only.
                     break
                 }
             }

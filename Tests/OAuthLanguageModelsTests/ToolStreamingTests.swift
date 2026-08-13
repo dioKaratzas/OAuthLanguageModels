@@ -296,6 +296,75 @@ extension StreamedExchange {
         }
 
         @Test
+        func `Each Anthropic round trip opens by saying what its prompt cost`() async throws {
+            let timeline = Timeline()
+            StubProtocol.install()
+            Exchange.shared.serve([Anthropic.askingForTheTool, Anthropic.answeringWithIt])
+            let model = Self.anthropic(onEvent: timeline.handler)
+            let session = LanguageModelSession(
+                model: model,
+                tools: [WeatherTool(callCount: Counter())],
+                transcript: Transcript()
+            )
+            for try await _ in model.streamResponse(
+                within: session,
+                to: Prompt("What is the weather in Athens?"),
+                generating: String.self,
+                includeSchemaInPrompt: false,
+                options: GenerationOptions()
+            ) {
+                timeline.noteAnswer()
+            }
+
+            // Once per round trip, and before any of the answer: the numbers are on the
+            // wire in `message_start`, ahead of the first content event.
+            #expect(timeline.opened.map(\.inputTokens) == [40, 90])
+            #expect(timeline.entries.first == "started")
+            let opening = try #require(timeline.entries.firstIndex(of: "started"))
+            let firstWords = try #require(timeline.entries.firstIndex(of: "answer"))
+            #expect(opening < firstWords)
+        }
+
+        @Test
+        func `An Anthropic answer asked for in one piece opens the same way`() async throws {
+            let timeline = Timeline()
+            StubProtocol.install()
+            Exchange.shared.serve([Anthropic.wholeToolCall, Anthropic.wholeAnswer])
+            let model = Self.anthropic(onEvent: timeline.handler)
+            let session = LanguageModelSession(
+                model: model,
+                tools: [WeatherTool(callCount: Counter())],
+                transcript: Transcript()
+            )
+            _ = try await model.respond(
+                within: session,
+                to: Prompt("What is the weather in Athens?"),
+                generating: String.self,
+                includeSchemaInPrompt: false,
+                options: GenerationOptions()
+            )
+
+            #expect(timeline.opened.map(\.inputTokens) == [40, 90])
+            // The whole response arrives at once, but the prompt side is still what it
+            // was, and it is still reported before the tool call it led to.
+            #expect(timeline.entries == ["started", "toolCall", "finished", "started", "finished"])
+        }
+
+        @Test
+        func `Codex says nothing about a turn until it is over`() async throws {
+            let timeline = Timeline()
+            _ = try await streamedSnapshots(
+                from: Self.codex(onEvent: timeline.handler),
+                turns: [Codex.askingForTheTool, Codex.answeringWithIt],
+                tools: [WeatherTool(callCount: Counter())]
+            )
+
+            // The Responses API has no early counting event, and one carrying zeroes would
+            // read as a cache miss rather than as silence.
+            #expect(timeline.opened.isEmpty)
+        }
+
+        @Test
         func `A turn with no tools reports no calls`() async throws {
             let calls = ToolCalls()
             _ = try await streamedSnapshots(
@@ -465,6 +534,44 @@ extension StreamedExchange {
                 maxToolRounds: maxToolRounds,
                 onEvent: onEvent
             )
+        }
+
+        /// What reached the caller, in the order it reached them — the events on the side
+        /// channel and the answer itself in one log, since the point is which came first.
+        private final class Timeline: @unchecked Sendable {
+            var entries: [String] {
+                lock.lock(); defer { lock.unlock() }
+                return log
+            }
+
+            var opened: [TokenUsage] {
+                lock.lock(); defer { lock.unlock() }
+                return openings
+            }
+
+            var handler: @Sendable (GenerationEvent) -> Void {
+                { event in
+                    self.lock.lock(); defer { self.lock.unlock() }
+                    switch event {
+                    case let .turnStarted(usage):
+                        self.openings.append(usage)
+                        self.log.append("started")
+                    case .reasoning: self.log.append("reasoning")
+                    case .toolCall: self.log.append("toolCall")
+                    case .turnFinished: self.log.append("finished")
+                    }
+                }
+            }
+
+            func noteAnswer() {
+                lock.lock(); defer { lock.unlock() }
+                guard log.last != "answer" else { return }
+                log.append("answer")
+            }
+
+            private let lock = NSLock()
+            private var log: [String] = []
+            private var openings: [TokenUsage] = []
         }
 
         private static func decode(_ body: String?) -> JSONValue {

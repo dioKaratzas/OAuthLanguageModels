@@ -120,6 +120,17 @@ public enum GenerationEvent: Hashable, Sendable {
     /// A piece of the model's reasoning, as it is written. Kept apart from the answer
     /// text on purpose — concatenating the two puts the model's scratch work in front of
     /// the reader as if it were the reply.
+    /// The turn has begun, and what its prompt cost is already known.
+    ///
+    /// Arrives before any content, once per request, so a caller can show what a question
+    /// cost to ask — and how much of it came out of the cache — without waiting for the
+    /// answer. Only the prompt side is filled: nothing has been written yet, so
+    /// `outputTokens` is zero.
+    ///
+    /// Anthropic only. The Responses API says nothing about a turn until it is over, and
+    /// an event carrying zeroes would read as a cache miss rather than as silence.
+    case turnStarted(TokenUsage)
+
     case reasoning(String)
 
     /// A tool the model asked for, once its arguments are whole.

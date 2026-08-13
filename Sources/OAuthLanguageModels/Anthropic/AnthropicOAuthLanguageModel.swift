@@ -85,9 +85,9 @@ public struct AnthropicOAuthLanguageModel: Sendable {
     /// until the caller cancelled, spending a turn's tokens each time round.
     public let maxToolRounds: Int
 
-    /// Called with everything a turn produces besides the answer text: the model's
-    /// reasoning as it is written, each tool it asks for once the arguments are whole,
-    /// and a ``TurnReport`` once per request.
+    /// Called with everything a turn produces besides the answer text: what the prompt
+    /// cost before a word is written, the model's reasoning as it is written, each tool it
+    /// asks for once the arguments are whole, and a ``TurnReport`` once per request.
     ///
     /// Fires on the streaming and the non-streaming path alike, and once per round trip
     /// of a tool-using exchange. Called from whichever task is draining the response, so
@@ -307,6 +307,8 @@ public struct AnthropicOAuthLanguageModel: Sendable {
     ) throws {
         guard let onEvent else { return }
         switch part {
+        case let .started(usage):
+            onEvent(.turnStarted(usage))
         case let .thinking(delta):
             onEvent(.reasoning(delta))
         case let .toolUse(use):
@@ -322,6 +324,11 @@ public struct AnthropicOAuthLanguageModel: Sendable {
 
     private func report(_ payload: AnthropicResponse) throws {
         guard let onEvent else { return }
+        if let usage = payload.usage {
+            var opening = TokenUsage(anthropic: usage)
+            opening.outputTokens = 0
+            onEvent(.turnStarted(opening))
+        }
         // In the order the model wrote them, so a caller sees the reasoning that led to a
         // call before the call itself.
         for block in payload.content {

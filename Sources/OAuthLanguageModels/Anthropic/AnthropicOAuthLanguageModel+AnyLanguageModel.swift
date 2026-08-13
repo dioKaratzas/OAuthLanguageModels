@@ -149,9 +149,10 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
                                 if let snapshot = try answer.append(delta) {
                                     continuation.yield(snapshot)
                                 }
-                            case .thinking:
-                                // Reasoning reaches the caller through the model's
-                                // `onEvent`, never as part of the answer.
+                            case .started, .thinking:
+                                // The opening count and the reasoning reach the caller
+                                // through the model's `onEvent`, never as part of the
+                                // answer.
                                 break
                             case let .toolUse(use):
                                 toolCalls.append(try Self.providerCall(for: use))

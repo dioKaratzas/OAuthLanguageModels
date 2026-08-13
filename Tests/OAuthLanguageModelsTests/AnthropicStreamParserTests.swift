@@ -151,6 +151,22 @@ struct AnthropicStreamParserTests {
     }
 
     @Test
+    func `A turn says what its prompt cost before it writes anything`() throws {
+        let parts = try drainAnthropic(Self.cached)
+
+        // `message_start` carries the whole prompt side, so a caller can show what a
+        // question cost to ask without waiting for the answer.
+        guard case let .started(opening) = parts.first else {
+            Issue.record("The turn did not open with its prompt count.")
+            return
+        }
+        #expect(opening.inputTokens == 14)
+        #expect(opening.cacheReadTokens == 15234)
+        // Nothing has been written yet; the one token counted here measures nothing.
+        #expect(opening.outputTokens == 0)
+    }
+
+    @Test
     func `A cache write is counted apart from a cache read`() throws {
         let report = try drainAnthropic(Self.toolUse).report
 

@@ -8,6 +8,8 @@ import Foundation
 /// call is not: its arguments are streamed as JSON fragments that mean nothing until the
 /// last one, so a call is only ever handed over complete.
 enum AnthropicStreamPart {
+    /// The turn has opened, and the prompt it read is already counted.
+    case started(TokenUsage)
     case text(String)
     case thinking(String)
     case toolUse(AnthropicResponse.ToolUse)
@@ -41,10 +43,14 @@ struct AnthropicStreamParser {
 
         switch event.type {
         case "message_start":
-            if let usage = event.message?.usage {
-                apply(usage)
-            }
-            return []
+            guard let usage = event.message?.usage else { return [] }
+            apply(usage)
+            // The prompt side only. The output count here is the one or two tokens of the
+            // opening, not a measure of anything, and reporting it would look like an
+            // answer that had already started.
+            var opening = TokenUsage(anthropic: usage)
+            opening.outputTokens = 0
+            return [.started(opening)]
 
         case "content_block_start":
             guard let index = event.index, let start = event.contentBlock else { return [] }
