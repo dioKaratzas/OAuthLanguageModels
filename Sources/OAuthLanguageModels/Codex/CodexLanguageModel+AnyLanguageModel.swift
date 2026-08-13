@@ -121,6 +121,7 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
                     let tools = session.tools.map(Self.convertTool)
                     var inputs = try await buildInputs(from: session.transcript)
                     var text = ""
+                    var hasOutput = false
 
                     while true {
                         var toolCalls: [CodexToolCall] = []
@@ -150,6 +151,7 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
                                 toolCalls.append(call)
                             case let .finished(response):
                                 reasoningItems = response.reasoningItems
+                                hasOutput = hasOutput || response.hasOutput
                             }
                         }
 
@@ -178,6 +180,13 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
                                 )
                             )
                         }
+                    }
+
+                    // A turn that produced neither text nor an output array produced
+                    // nothing at all, which is worth an error rather than an empty stream
+                    // the caller has to interpret.
+                    guard !text.isEmpty || hasOutput else {
+                        throw CodexLanguageModelError.noResponseGenerated
                     }
                     continuation.finish()
                 } catch {

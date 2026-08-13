@@ -74,7 +74,7 @@ struct CodexStreamParser {
         case "response.output_item.done":
             guard let item = object["item"]?.objectValue, Self.isFunctionCall(item) else { return [] }
             open(item)
-            return close(itemID: item["id"]?.stringValue).map { [.toolCall($0)] } ?? []
+            return close(item).map { [.toolCall($0)] } ?? []
 
         case "response.completed", "response.incomplete":
             return finish(stopReason: Self.stopReason(in: object))
@@ -102,7 +102,7 @@ struct CodexStreamParser {
         for item in latestOutput ?? [] {
             guard let object = item.objectValue, Self.isFunctionCall(object) else { continue }
             open(object)
-            if let call = close(itemID: object["id"]?.stringValue) {
+            if let call = close(object) {
                 missed.append(.toolCall(call))
             }
         }
@@ -196,12 +196,17 @@ struct CodexStreamParser {
         self.usage.outputTokens = usage["output_tokens"]?.intValue ?? 0
     }
 
+    /// What the argument deltas key on: the item id where there is one, since that is
+    /// what `response.function_call_arguments.delta` carries, and the call id otherwise.
+    private static func key(of item: [String: JSONValue]) -> String? {
+        let key = item["id"]?.stringValue ?? item["call_id"]?.stringValue
+        return (key?.isEmpty ?? true) ? nil : key
+    }
+
     private mutating func open(_ item: [String: JSONValue]) {
-        let itemID = item["id"]?.stringValue
-        let key = itemID ?? item["call_id"]?.stringValue ?? ""
-        guard !key.isEmpty else { return }
+        guard let key = Self.key(of: item) else { return }
         var call = pending[key] ?? PendingCall()
-        call.callID = item["call_id"]?.stringValue ?? call.callID ?? itemID
+        call.callID = item["call_id"]?.stringValue ?? call.callID ?? item["id"]?.stringValue
         call.name = item["name"]?.stringValue ?? call.name
         if let arguments = item["arguments"]?.stringValue, !arguments.isEmpty {
             call.arguments = arguments
@@ -209,8 +214,8 @@ struct CodexStreamParser {
         pending[key] = call
     }
 
-    private mutating func close(itemID: String?) -> CodexToolCall? {
-        guard let key = itemID, let call = pending.removeValue(forKey: key),
+    private mutating func close(_ item: [String: JSONValue]) -> CodexToolCall? {
+        guard let key = Self.key(of: item), let call = pending.removeValue(forKey: key),
               let callID = call.callID, let name = call.name,
               !callID.isEmpty, !name.isEmpty, !emittedIDs.contains(callID) else {
             return nil

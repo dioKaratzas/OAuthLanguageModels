@@ -216,6 +216,32 @@ struct AnthropicStreamParserTests {
     }
 
     @Test
+    func `A block that opened and closed empty is left out of the replayed turn`() throws {
+        let trace = """
+        event: content_block_start
+        data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+        event: content_block_stop
+        data: {"type":"content_block_stop","index":0}
+
+        event: content_block_start
+        data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"get_weather","input":{}}}
+
+        event: content_block_stop
+        data: {"type":"content_block_stop","index":1}
+
+        event: message_stop
+        data: {"type":"message_stop"}
+        """
+        let content = try drainAnthropic(trace).replayedContent
+
+        // A model that goes straight to a tool call still opens a text block, and the API
+        // refuses an assistant turn that comes back carrying an empty one.
+        #expect(content.count == 1)
+        if case .toolUse = content.first {} else { Issue.record("The tool call was not replayed.") }
+    }
+
+    @Test
     func `An error mid-stream is thrown rather than ending the answer quietly`() throws {
         let trace = """
         event: content_block_start

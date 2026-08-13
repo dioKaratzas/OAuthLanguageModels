@@ -154,14 +154,23 @@ struct AnthropicStreamParser {
         }
     }
 
+    /// Adds the finished block to the turn that will be replayed, and hands back a part
+    /// for the kinds a caller has to act on.
+    ///
+    /// A block that opened and closed with nothing in it is left out: the API refuses an
+    /// assistant turn containing an empty text or thinking block, and a model that goes
+    /// straight to a tool call opens one all the same.
     private mutating func close(_ block: Block) -> [AnthropicStreamPart] {
         switch block.type {
         case "text":
+            guard !block.text.isEmpty else { break }
             content.append(.text(.init(text: block.text)))
         case "thinking":
+            guard !block.thinking.isEmpty else { break }
             content.append(.thinking(.init(thinking: block.thinking, signature: block.signature)))
         case "redacted_thinking":
-            content.append(.redactedThinking(.init(data: block.data ?? "")))
+            guard let data = block.data, !data.isEmpty else { break }
+            content.append(.redactedThinking(.init(data: data)))
         case "tool_use":
             guard let id = block.id, let name = block.name else { return [] }
             let arguments = block.arguments.isEmpty ? "{}" : block.arguments
