@@ -1,5 +1,11 @@
 import Foundation
 
+/// How many tool rounds an exchange gets before the package stops feeding it.
+///
+/// Well above what an ordinary question needs, and far below the point where a model
+/// stuck in a loop has spent real money.
+public let defaultMaxToolRounds = 8
+
 // MARK: - TokenUsage
 
 /// What a turn cost, normalized across providers.

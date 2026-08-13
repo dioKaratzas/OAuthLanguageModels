@@ -21,6 +21,7 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
         var inputs = try await buildInputs(from: session.transcript)
         let tools = session.tools.map(Self.convertTool)
         var entries: [Transcript.Entry] = []
+        var rounds = 0
 
         while true {
             let response = try await send(
@@ -67,6 +68,10 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
                                 )
                             )
                         }
+                        rounds += 1
+                        guard rounds < maxToolRounds else {
+                            throw CodexLanguageModelError.toolLoopLimitExceeded(rounds: rounds)
+                        }
                         continue
                     }
                 }
@@ -95,6 +100,11 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
     /// turn does not have that turn's calls in its transcript afterwards. Use
     /// ``respond(within:to:generating:includeSchemaInPrompt:options:)`` where the
     /// transcript has to be complete.
+    ///
+    /// A `.stop` decision from a `ToolExecutionDelegate` ends the stream with what has
+    /// already been written: a snapshot the caller has been shown cannot be withdrawn, so
+    /// the answer stands as far as it got rather than being replaced by an empty one the
+    /// way ``respond(within:to:generating:includeSchemaInPrompt:options:)`` does.
     public func streamResponse<Content: Generable>(
         within session: LanguageModelSession,
         to prompt: Prompt,
@@ -122,6 +132,7 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
                     var inputs = try await buildInputs(from: session.transcript)
                     var text = ""
                     var hasOutput = false
+                    var rounds = 0
 
                     while true {
                         var toolCalls: [CodexToolCall] = []
@@ -179,6 +190,10 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
                                     output: Self.toolOutputString(invocation.output.segments)
                                 )
                             )
+                        }
+                        rounds += 1
+                        guard rounds < maxToolRounds else {
+                            throw CodexLanguageModelError.toolLoopLimitExceeded(rounds: rounds)
                         }
                     }
 

@@ -21,6 +21,7 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
         var messages = try Self.buildMessages(from: session.transcript)
         let tools = try session.tools.map(Self.convertTool)
         var entries: [Transcript.Entry] = []
+        var rounds = 0
 
         while true {
             let payload = try await send(
@@ -68,6 +69,10 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
                                 )
                             )
                         }
+                        rounds += 1
+                        guard rounds < maxToolRounds else {
+                            throw AnthropicOAuthLanguageModelError.toolLoopLimitExceeded(rounds: rounds)
+                        }
                         continue
                     }
                 }
@@ -97,6 +102,11 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
     /// turn does not have that turn's calls in its transcript afterwards. Use
     /// ``respond(within:to:generating:includeSchemaInPrompt:options:)`` where the
     /// transcript has to be complete.
+    ///
+    /// A `.stop` decision from a `ToolExecutionDelegate` ends the stream with what has
+    /// already been written: a snapshot the caller has been shown cannot be withdrawn, so
+    /// the answer stands as far as it got rather than being replaced by an empty one the
+    /// way ``respond(within:to:generating:includeSchemaInPrompt:options:)`` does.
     public func streamResponse<Content: Generable>(
         within session: LanguageModelSession,
         to prompt: Prompt,
@@ -123,6 +133,7 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
                     let tools = try session.tools.map(Self.convertTool)
                     var messages = try Self.buildMessages(from: session.transcript)
                     var text = ""
+                    var rounds = 0
 
                     while true {
                         var toolCalls: [ProviderToolCall] = []
@@ -178,6 +189,10 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
                                     ]
                                 )
                             )
+                        }
+                        rounds += 1
+                        guard rounds < maxToolRounds else {
+                            throw AnthropicOAuthLanguageModelError.toolLoopLimitExceeded(rounds: rounds)
                         }
                     }
                     continuation.finish()

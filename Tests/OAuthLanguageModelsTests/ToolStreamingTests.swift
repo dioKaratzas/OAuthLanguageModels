@@ -182,7 +182,65 @@ struct ToolStreamingTests {
         #expect(snapshots.last?.contains("They want Athens.") == false)
     }
 
+    @Test
+    func `A model that only ever calls tools is cut off rather than run forever`() async throws {
+        let calls = Counter()
+
+        await #expect(throws: AnthropicOAuthLanguageModelError.self) {
+            try await streamedSnapshots(
+                from: Self.anthropic(maxToolRounds: 3),
+                turns: [Anthropic.askingForTheTool],
+                tools: [WeatherTool(callCount: calls)],
+                repeatingLastTurn: true
+            )
+        }
+        // Three rounds fed back, and the fourth request never made.
+        #expect(calls.count == 3)
+    }
+
+    @Test
+    func `A Codex model that only ever calls tools is cut off too`() async throws {
+        let calls = Counter()
+
+        await #expect(throws: CodexLanguageModelError.self) {
+            try await streamedSnapshots(
+                from: Self.codex(maxToolRounds: 3),
+                turns: [Codex.askingForTheTool],
+                tools: [WeatherTool(callCount: calls)],
+                repeatingLastTurn: true
+            )
+        }
+        #expect(calls.count == 3)
+    }
+
+    @Test
+    func `A stopped tool call leaves the answer as far as it got`() async throws {
+        let calls = Counter()
+        let snapshots = try await streamedSnapshots(
+            from: Self.anthropic(),
+            turns: [Anthropic.askingForTheTool, Anthropic.answeringWithIt],
+            tools: [WeatherTool(callCount: calls)],
+            delegate: StoppingDelegate()
+        )
+
+        // A snapshot the caller has already been shown cannot be withdrawn, so the text
+        // written before the call stands — but the tool never runs and no second turn is
+        // opened for it.
+        #expect(calls.count == 0)
+        #expect(snapshots.last == "Let me check. ")
+        #expect(Exchange.shared.requestBodies.count == 1)
+    }
+
     // MARK: Private
+
+    private struct StoppingDelegate: ToolExecutionDelegate {
+        func toolCallDecision(
+            for _: Transcript.ToolCall,
+            in _: LanguageModelSession
+        ) async -> ToolExecutionDecision {
+            .stop
+        }
+    }
 
     private final class Deltas: @unchecked Sendable {
         var values: [String] {
@@ -203,17 +261,25 @@ struct ToolStreamingTests {
     }
 
     private static func anthropic(
+        maxToolRounds: Int = defaultMaxToolRounds,
         onEvent: (@Sendable (GenerationEvent) -> Void)? = nil
     ) -> AnthropicOAuthLanguageModel {
-        AnthropicOAuthLanguageModel(tokenProvider: { "token" }, model: "claude-opus-5", onEvent: onEvent)
+        AnthropicOAuthLanguageModel(
+            tokenProvider: { "token" },
+            model: "claude-opus-5",
+            maxToolRounds: maxToolRounds,
+            onEvent: onEvent
+        )
     }
 
     private static func codex(
+        maxToolRounds: Int = defaultMaxToolRounds,
         onEvent: (@Sendable (GenerationEvent) -> Void)? = nil
     ) -> CodexLanguageModel {
         CodexLanguageModel(
             tokenProvider: { CodexToken(accessToken: "token", accountID: "account") },
             model: "gpt-5",
+            maxToolRounds: maxToolRounds,
             onEvent: onEvent
         )
     }

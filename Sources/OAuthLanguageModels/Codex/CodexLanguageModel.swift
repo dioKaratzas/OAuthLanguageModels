@@ -32,6 +32,7 @@ public struct CodexLanguageModel: Sendable {
         baseURL: URL = defaultCodexResponsesBaseURL,
         sessionID: String = UUID().uuidString.lowercased(),
         originator: String = "OAuthLanguageModels",
+        maxToolRounds: Int = defaultMaxToolRounds,
         onEvent: (@Sendable (GenerationEvent) -> Void)? = nil
     ) {
         self.tokenProvider = tokenProvider
@@ -39,6 +40,7 @@ public struct CodexLanguageModel: Sendable {
         self.baseURL = baseURL
         self.sessionID = sessionID
         self.originator = originator
+        self.maxToolRounds = maxToolRounds
         self.onEvent = onEvent
         state = CodexSessionState()
     }
@@ -52,6 +54,13 @@ public struct CodexLanguageModel: Sendable {
     /// Identifies the client to OpenAI. Sent as the `originator` HTTP header
     /// and audited server-side.
     public let originator: String
+
+    /// How many times a single exchange may hand tool results back before the package
+    /// gives up on it.
+    ///
+    /// A model that answers every tool result with another tool call would otherwise run
+    /// until the caller cancelled, spending a turn's tokens each time round.
+    public let maxToolRounds: Int
 
     /// Called with everything a turn produces besides the answer text: the model's
     /// reasoning as it is written, and a ``TurnReport`` once per request.
@@ -491,6 +500,7 @@ public enum CodexLanguageModelError: LocalizedError, Sendable {
     case requestFailed(statusCode: Int, message: String)
     case unsupportedContentType
     case noResponseGenerated
+    case toolLoopLimitExceeded(rounds: Int)
 
     // MARK: Public
 
@@ -504,6 +514,8 @@ public enum CodexLanguageModelError: LocalizedError, Sendable {
             "CodexLanguageModel only supports text responses."
         case .noResponseGenerated:
             "Codex did not produce any text or tool calls."
+        case let .toolLoopLimitExceeded(rounds):
+            "Codex kept calling tools after \(rounds) rounds without answering."
         }
     }
 }

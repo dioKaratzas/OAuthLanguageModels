@@ -41,6 +41,7 @@ public struct AnthropicOAuthLanguageModel: Sendable {
         longCacheRetention: Bool = false,
         extraBetas: [String] = [],
         extraHeaders: [String: String] = [:],
+        maxToolRounds: Int = defaultMaxToolRounds,
         onEvent: (@Sendable (GenerationEvent) -> Void)? = nil
     ) {
         self.tokenProvider = tokenProvider
@@ -50,6 +51,7 @@ public struct AnthropicOAuthLanguageModel: Sendable {
         self.longCacheRetention = longCacheRetention
         self.extraBetas = extraBetas
         self.extraHeaders = extraHeaders
+        self.maxToolRounds = maxToolRounds
         self.onEvent = onEvent
     }
 
@@ -75,6 +77,13 @@ public struct AnthropicOAuthLanguageModel: Sendable {
     /// ``reservedBodyKeys`` protects the body: they are what the API honours a
     /// subscription token for, and overriding them only produces a 401.
     public let extraHeaders: [String: String]
+
+    /// How many times a single exchange may hand tool results back before the package
+    /// gives up on it.
+    ///
+    /// A model that answers every tool result with another tool call would otherwise run
+    /// until the caller cancelled, spending a turn's tokens each time round.
+    public let maxToolRounds: Int
 
     /// Called with everything a turn produces besides the answer text: the model's
     /// reasoning as it is written, and a ``TurnReport`` once per request.
@@ -688,6 +697,7 @@ public enum AnthropicOAuthLanguageModelError: LocalizedError, Sendable {
     case invalidResponse
     case requestFailed(statusCode: Int, message: String)
     case unsupportedContentType
+    case toolLoopLimitExceeded(rounds: Int)
 
     // MARK: Public
 
@@ -699,6 +709,8 @@ public enum AnthropicOAuthLanguageModelError: LocalizedError, Sendable {
             "Anthropic request failed with status \(statusCode): \(message)"
         case .unsupportedContentType:
             "AnthropicOAuthLanguageModel only supports text responses."
+        case let .toolLoopLimitExceeded(rounds):
+            "Claude kept calling tools after \(rounds) rounds without answering."
         }
     }
 }

@@ -18,6 +18,7 @@ final class Exchange: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         pending = turns
         sent = []
+        repeatsLast = false
     }
 
     func record(_ body: String) {
@@ -27,7 +28,17 @@ final class Exchange: @unchecked Sendable {
 
     func next() -> String {
         lock.lock(); defer { lock.unlock() }
+        if pending.count == 1, repeatsLast { return pending[0] }
         return pending.isEmpty ? "" : pending.removeFirst()
+    }
+
+    /// Serves the last turn over and over once the rest have been handed out, for the
+    /// exchanges that are meant never to settle.
+    func serveForever(_ turns: [String]) {
+        lock.lock(); defer { lock.unlock() }
+        pending = turns
+        sent = []
+        repeatsLast = true
     }
 
     // MARK: Private
@@ -35,6 +46,7 @@ final class Exchange: @unchecked Sendable {
     private let lock = NSLock()
     private var pending: [String] = []
     private var sent: [String] = []
+    private var repeatsLast = false
 }
 
 // MARK: - StubProtocol
@@ -152,13 +164,20 @@ final class Reports: @unchecked Sendable {
 func streamedSnapshots(
     from model: some AnyLanguageModel.LanguageModel,
     turns: [String],
-    tools: [any Tool]
+    tools: [any Tool],
+    repeatingLastTurn: Bool = false,
+    delegate: (any ToolExecutionDelegate)? = nil
 ) async throws -> [String] {
     URLProtocol.registerClass(StubProtocol.self)
     defer { URLProtocol.unregisterClass(StubProtocol.self) }
-    Exchange.shared.serve(turns)
+    if repeatingLastTurn {
+        Exchange.shared.serveForever(turns)
+    } else {
+        Exchange.shared.serve(turns)
+    }
 
     let session = LanguageModelSession(model: model, tools: tools, transcript: Transcript())
+    session.toolExecutionDelegate = delegate
     var snapshots: [String] = []
     for try await snapshot in model.streamResponse(
         within: session,
