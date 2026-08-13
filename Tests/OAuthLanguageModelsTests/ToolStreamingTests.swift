@@ -37,6 +37,20 @@ extension StreamedExchange {
 
             """
 
+            /// The same exchange as a pair of whole responses, for the path that asks for
+            /// the answer in one piece.
+            static let wholeToolCall = """
+            {"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5",\
+            "content":[{"type":"tool_use","id":"toolu_01","name":"get_weather","input":{"location":"Athens"}}],\
+            "stop_reason":"tool_use","usage":{"input_tokens":40,"output_tokens":40}}
+            """
+
+            static let wholeAnswer = """
+            {"id":"msg_02","type":"message","role":"assistant","model":"claude-opus-5",\
+            "content":[{"type":"text","text":"It is 17C in Athens."}],\
+            "stop_reason":"end_turn","usage":{"input_tokens":90,"output_tokens":12}}
+            """
+
             static let answeringWithIt = """
             data: {"type":"message_start","message":{"id":"msg_02","type":"message","role":"assistant","content":[],"usage":{"input_tokens":90,"output_tokens":1}}}
 
@@ -123,6 +137,100 @@ extension StreamedExchange {
 
             #expect(reports.values.map(\.stopReason) == [.toolUse, .endTurn])
             #expect(reports.values.map(\.usage.inputTokens) == [40, 90])
+        }
+
+        @Test
+        func `Anthropic reports the call it is about to make, once, with its arguments`() async throws {
+            let calls = ToolCalls()
+            _ = try await streamedSnapshots(
+                from: Self.anthropic(onEvent: calls.handler),
+                turns: [Anthropic.askingForTheTool, Anthropic.answeringWithIt],
+                tools: [WeatherTool(callCount: Counter())]
+            )
+
+            // One event per call, not one per argument fragment: the arguments arrived in
+            // two pieces and neither of them parses on its own.
+            #expect(calls.values.count == 1)
+            #expect(calls.values.first?.name == "get_weather")
+            #expect(calls.values.first?.arguments == #"{"location":"Athens"}"#)
+        }
+
+        @Test
+        func `Codex reports the call it is about to make, once, with its arguments`() async throws {
+            let calls = ToolCalls()
+            _ = try await streamedSnapshots(
+                from: Self.codex(onEvent: calls.handler),
+                turns: [Codex.askingForTheTool, Codex.answeringWithIt],
+                tools: [WeatherTool(callCount: Counter())]
+            )
+
+            // Once, though the call appears again in the final output array the turn ends
+            // with.
+            #expect(calls.values.count == 1)
+            #expect(calls.values.first?.name == "get_weather")
+            #expect(calls.values.first?.arguments == #"{"location": "Athens"}"#)
+        }
+
+        @Test
+        func `An Anthropic answer asked for in one piece reports its calls too`() async throws {
+            let calls = ToolCalls()
+            StubProtocol.install()
+            Exchange.shared.serve([Anthropic.wholeToolCall, Anthropic.wholeAnswer])
+            let model = Self.anthropic(onEvent: calls.handler)
+            let session = LanguageModelSession(
+                model: model,
+                tools: [WeatherTool(callCount: Counter())],
+                transcript: Transcript()
+            )
+            let response = try await model.respond(
+                within: session,
+                to: Prompt("What is the weather in Athens?"),
+                generating: String.self,
+                includeSchemaInPrompt: false,
+                options: GenerationOptions()
+            )
+
+            // The non-streaming path reads whole content blocks rather than fragments, and
+            // still reports one event per call.
+            #expect(calls.values.count == 1)
+            #expect(calls.values.first?.name == "get_weather")
+            #expect(calls.values.first?.arguments == #"{"location":"Athens"}"#)
+            #expect(response.content == "It is 17C in Athens.")
+        }
+
+        @Test
+        func `A Codex answer asked for in one piece reports its calls too`() async throws {
+            let calls = ToolCalls()
+            StubProtocol.install()
+            Exchange.shared.serve([Codex.askingForTheTool, Codex.answeringWithIt])
+            let model = Self.codex(onEvent: calls.handler)
+            let session = LanguageModelSession(
+                model: model,
+                tools: [WeatherTool(callCount: Counter())],
+                transcript: Transcript()
+            )
+            _ = try await model.respond(
+                within: session,
+                to: Prompt("What is the weather in Athens?"),
+                generating: String.self,
+                includeSchemaInPrompt: false,
+                options: GenerationOptions()
+            )
+
+            #expect(calls.values.count == 1)
+            #expect(calls.values.first?.name == "get_weather")
+        }
+
+        @Test
+        func `A turn with no tools reports no calls`() async throws {
+            let calls = ToolCalls()
+            _ = try await streamedSnapshots(
+                from: Self.anthropic(onEvent: calls.handler),
+                turns: [Anthropic.answeringWithIt],
+                tools: []
+            )
+
+            #expect(calls.values.isEmpty)
         }
 
         @Test

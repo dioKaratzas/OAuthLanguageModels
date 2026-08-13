@@ -86,7 +86,8 @@ public struct AnthropicOAuthLanguageModel: Sendable {
     public let maxToolRounds: Int
 
     /// Called with everything a turn produces besides the answer text: the model's
-    /// reasoning as it is written, and a ``TurnReport`` once per request.
+    /// reasoning as it is written, each tool it asks for once the arguments are whole,
+    /// and a ``TurnReport`` once per request.
     ///
     /// Fires on the streaming and the non-streaming path alike, and once per round trip
     /// of a tool-using exchange. Called from whichever task is draining the response, so
@@ -238,7 +239,7 @@ public struct AnthropicOAuthLanguageModel: Sendable {
 
                 do {
                     let payload = try JSONDecoder.snakeCase.decode(AnthropicResponse.self, from: data)
-                    self.report(payload)
+                    try self.report(payload)
                     return payload
                 } catch {
                     throw AnthropicOAuthLanguageModelError.invalidResponse
@@ -280,12 +281,12 @@ public struct AnthropicOAuthLanguageModel: Sendable {
                     var parser = AnthropicStreamParser()
                     for try await line in bytes.lines {
                         for part in try parser.consume(line: line) {
-                            Self.announce(part, to: onEvent)
+                            try Self.announce(part, to: onEvent)
                             continuation.yield(part)
                         }
                     }
                     for part in parser.finish() {
-                        Self.announce(part, to: onEvent)
+                        try Self.announce(part, to: onEvent)
                         continuation.yield(part)
                     }
                     continuation.finish()
@@ -300,19 +301,35 @@ public struct AnthropicOAuthLanguageModel: Sendable {
     private static func announce(
         _ part: AnthropicStreamPart,
         to onEvent: (@Sendable (GenerationEvent) -> Void)?
-    ) {
+    ) throws {
         guard let onEvent else { return }
         switch part {
-        case let .thinking(delta): onEvent(.reasoning(delta))
-        case let .finished(_, report): onEvent(.turnFinished(report))
-        case .text, .toolUse: break
+        case let .thinking(delta):
+            onEvent(.reasoning(delta))
+        case let .toolUse(use):
+            // The parser hands a call over once, at its closing block, so this is one
+            // event per call rather than one per argument fragment.
+            onEvent(.toolCall(name: use.name, arguments: try use.argumentsJSONString()))
+        case let .finished(_, report):
+            onEvent(.turnFinished(report))
+        case .text:
+            break
         }
     }
 
-    private func report(_ payload: AnthropicResponse) {
+    private func report(_ payload: AnthropicResponse) throws {
         guard let onEvent else { return }
-        for case let .thinking(thinking) in payload.content where !thinking.thinking.isEmpty {
-            onEvent(.reasoning(thinking.thinking))
+        // In the order the model wrote them, so a caller sees the reasoning that led to a
+        // call before the call itself.
+        for block in payload.content {
+            switch block {
+            case let .thinking(thinking) where !thinking.thinking.isEmpty:
+                onEvent(.reasoning(thinking.thinking))
+            case let .toolUse(use):
+                onEvent(.toolCall(name: use.name, arguments: try use.argumentsJSONString()))
+            default:
+                break
+            }
         }
         onEvent(
             .turnFinished(

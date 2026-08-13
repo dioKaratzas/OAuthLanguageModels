@@ -185,6 +185,31 @@ final class Reports: @unchecked Sendable {
     }
 }
 
+// MARK: - ToolCalls
+
+/// The tool calls reported through a model's event channel.
+final class ToolCalls: @unchecked Sendable {
+    // MARK: Internal
+
+    var values: [(name: String, arguments: String)] {
+        lock.lock(); defer { lock.unlock() }
+        return storage
+    }
+
+    var handler: @Sendable (GenerationEvent) -> Void {
+        { event in
+            guard case let .toolCall(name, arguments) = event else { return }
+            self.lock.lock(); defer { self.lock.unlock() }
+            self.storage.append((name, arguments))
+        }
+    }
+
+    // MARK: Private
+
+    private let lock = NSLock()
+    private var storage: [(name: String, arguments: String)] = []
+}
+
 /// Runs a whole streamed exchange against `turns`, and hands back every snapshot the
 /// caller would have seen.
 func streamedSnapshots(

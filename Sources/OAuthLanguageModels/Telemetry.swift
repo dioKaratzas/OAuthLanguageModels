@@ -109,7 +109,8 @@ public struct TurnReport: Hashable, Sendable {
 
 // MARK: - GenerationEvent
 
-/// Everything a turn produces that is not the answer itself.
+/// Everything a turn produces that is not the answer itself — the reasoning behind it,
+/// the tools it asked for, and what it cost.
 ///
 /// Neither `AnyLanguageModel.LanguageModelSession.Response` nor its streaming `Snapshot`
 /// has a slot to carry this, and the same model also serves FoundationModels, whose
@@ -120,6 +121,14 @@ public enum GenerationEvent: Hashable, Sendable {
     /// text on purpose — concatenating the two puts the model's scratch work in front of
     /// the reader as if it were the reply.
     case reasoning(String)
+
+    /// A tool the model asked for, once its arguments are whole.
+    ///
+    /// Reported before the tool runs and once per call, so a caller can say what is being
+    /// done while it is being done. The arguments are the JSON object the model wrote;
+    /// they are never handed over half-written, since a fragment of one parses as
+    /// nothing.
+    case toolCall(name: String, arguments: String)
 
     /// The turn is over. Arrives once per request, after the last content.
     case turnFinished(TurnReport)

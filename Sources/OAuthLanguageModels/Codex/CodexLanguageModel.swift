@@ -63,7 +63,8 @@ public struct CodexLanguageModel: Sendable {
     public let maxToolRounds: Int
 
     /// Called with everything a turn produces besides the answer text: the model's
-    /// reasoning as it is written, and a ``TurnReport`` once per request.
+    /// reasoning as it is written, each tool it asks for once the arguments are whole,
+    /// and a ``TurnReport`` once per request.
     ///
     /// Fires on the streaming and the non-streaming path alike, and once per round trip
     /// of a tool-using exchange. Called from whichever task is draining the response, so
@@ -332,9 +333,17 @@ public struct CodexLanguageModel: Sendable {
     ) {
         guard let onEvent else { return }
         switch part {
-        case let .reasoning(delta): onEvent(.reasoning(delta))
-        case let .finished(response): onEvent(.turnFinished(response.report))
-        case .text, .toolCall: break
+        case let .reasoning(delta):
+            onEvent(.reasoning(delta))
+        case let .toolCall(call):
+            // The parser hands a call over once, when its item closes, so this is one
+            // event per call however many fragments its arguments arrived in — and the
+            // sweep of the final output array does not repeat one already seen.
+            onEvent(.toolCall(name: call.name, arguments: call.argumentsJSON))
+        case let .finished(response):
+            onEvent(.turnFinished(response.report))
+        case .text:
+            break
         }
     }
 
