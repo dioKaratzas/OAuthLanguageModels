@@ -56,6 +56,42 @@ Add the `AnyLanguageModel` product to your target when you use this path:
 .product(name: "AnyLanguageModel", package: "AnyLanguageModel"),
 ```
 
+### Streaming, with or without tools
+
+A streamed text turn runs the tool loop as it goes: the model's calls are assembled from their argument fragments, resolved against the session's tools, sent back, and another streamed turn is opened for as long as the model keeps asking. Snapshots stay cumulative across the whole exchange, so appending the tail of each one gives a single continuous answer with the tool round invisible in the middle of it.
+
+A structured type (anything other than `String`) still comes back in one piece — it is only decodable whole.
+
+One thing streaming cannot do is report transcript entries: `ResponseStream` has nowhere to put them, so a session that streams a tool-using turn does not have that turn's calls in its transcript afterwards. Use `respond` where the transcript has to be complete.
+
+### What a turn cost, and why it stopped
+
+`onEvent` reports everything a turn produces besides the answer itself — the model's reasoning as it is written, and a `TurnReport` once per request:
+
+```swift
+let model = AnthropicOAuthLanguageModel(
+    tokenProvider: { "sk-ant-oat01-…" },
+    model: "claude-sonnet-4-5",
+    onEvent: { event in
+        switch event {
+        case let .reasoning(delta):
+            thinkingView.append(delta)
+        case let .turnFinished(report):
+            print(report.usage.inputTokens, "read,", report.usage.cacheReadTokens, "from cache")
+            if report.stopReason == .maxTokens {
+                print("The answer is cut off.")
+            }
+        }
+    }
+)
+```
+
+It fires on the streaming and the non-streaming path alike, and once per round trip of a tool-using exchange.
+
+`TokenUsage` is normalized across the two providers: `inputTokens` counts only what was read at full price, with `cacheReadTokens` and `cacheWriteTokens` beside it — so a warm prompt cache is visible as such rather than looking like a full-price read.
+
+Reasoning is deliberately not part of the answer. It never reaches a snapshot or `response.content`, so it cannot be concatenated into the reply by accident.
+
 ### With Apple's FoundationModels (iOS/macOS/visionOS 27+)
 
 The examples below import `FoundationModels`. The same model values are used; just pick the import that matches the `LanguageModelSession` you want.

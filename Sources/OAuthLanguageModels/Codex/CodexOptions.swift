@@ -95,10 +95,15 @@ public extension CodexLanguageModel {
         public var toolChoice: ToolChoice?
         /// Additional keys to merge into the top-level request body.
         ///
+        /// An object under a key the package already writes — `text`,
+        /// `reasoning` — merges into it field by field rather than
+        /// replacing it, so one field can be added without restating the
+        /// rest. Every other kind of value replaces outright.
+        ///
         /// Reserved keys (`model`, `input`, `instructions`, `tools`,
         /// `prompt_cache_key`, `store`, `stream`, `include`) are dropped
         /// to preserve correctness of the Codex/OAuth request shape and
-        /// the cache contract.
+        /// the cache contract. A dropped key is logged at notice level.
         public var extraBody: [String: JSONValue]?
     }
 }

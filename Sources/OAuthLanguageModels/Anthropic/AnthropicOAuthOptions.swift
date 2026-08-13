@@ -76,9 +76,14 @@ public extension AnthropicOAuthLanguageModel {
         public var thinking: Thinking?
         /// Additional keys to merge into the top-level request body.
         ///
+        /// An object under a key the package already writes — `thinking`,
+        /// for one — merges into it field by field rather than replacing
+        /// it, so one field can be added without restating the rest.
+        /// Every other kind of value replaces outright.
+        ///
         /// Reserved keys (`model`, `system`, `messages`, `tools`) are
         /// dropped to preserve the integrity of the OAuth/Claude Code
-        /// request shape.
+        /// request shape. A dropped key is logged at notice level.
         public var extraBody: [String: JSONValue]?
     }
 }
