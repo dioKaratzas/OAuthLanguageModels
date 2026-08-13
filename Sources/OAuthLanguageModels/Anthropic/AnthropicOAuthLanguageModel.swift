@@ -464,12 +464,6 @@ struct AnthropicRequest: Encodable {
 // MARK: - AnthropicTool
 
 struct AnthropicTool: Codable {
-    enum CodingKeys: String, CodingKey {
-        case name
-        case description
-        case inputSchema = "input_schema"
-    }
-
     let name: String
     let description: String
     let inputSchema: JSONValue
@@ -591,13 +585,6 @@ struct AnthropicResponse: Decodable, Sendable {
         // MARK: Internal
 
         struct Source: Codable, Sendable {
-            enum CodingKeys: String, CodingKey {
-                case type
-                case mediaType = "media_type"
-                case data
-                case url
-            }
-
             let type: String
             let mediaType: String?
             let data: String?
@@ -639,11 +626,15 @@ struct AnthropicResponse: Decodable, Sendable {
 
         // MARK: Internal
 
+        /// Spelled the way the decoder's key strategy leaves it, not the way the wire
+        /// spells it: `convertFromSnakeCase` turns `tool_use_id` into `toolUseId`, and
+        /// `convertToSnakeCase` turns that back into `tool_use_id` on the way out. A
+        /// literal `"tool_use_id"` here would match on encode and never on decode.
         enum CodingKeys: String, CodingKey {
             case type
-            case toolUseID = "tool_use_id"
+            case toolUseID = "toolUseId"
             case content
-            case cacheControl = "cache_control"
+            case cacheControl
         }
 
         let type: String

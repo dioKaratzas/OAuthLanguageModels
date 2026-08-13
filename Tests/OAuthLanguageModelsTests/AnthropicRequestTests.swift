@@ -137,6 +137,64 @@ struct AnthropicRequestTests {
         #expect(request.value(forHTTPHeaderField: "x-trace-id") == "abc")
     }
 
+    @Test
+    func `A tool result survives the round trip the shared coders make of it`() throws {
+        let blocks: [AnthropicResponse.ContentBlock] = [
+            .toolResult(.init(toolUseID: "toolu_01", content: [.text(.init(text: "17C"))]))
+        ]
+        let data = try JSONEncoder.snakeCase.encode(blocks)
+
+        // The key strategies are applied to both ends, so a `CodingKeys` literal that
+        // matches the wire on the way out matches nothing on the way back.
+        #expect(String(decoding: data, as: UTF8.self).contains(#""tool_use_id":"toolu_01""#))
+        let decoded = try JSONDecoder.snakeCase.decode([AnthropicResponse.ContentBlock].self, from: data)
+        guard case let .toolResult(result) = decoded.first else {
+            Issue.record("The tool result did not decode.")
+            return
+        }
+        #expect(result.toolUseID == "toolu_01")
+    }
+
+    @Test
+    func `An image survives the round trip the shared coders make of it`() throws {
+        let blocks: [AnthropicResponse.ContentBlock] = [
+            .image(.init(base64Data: "aGk=", mimeType: "image/png"))
+        ]
+        let data = try JSONEncoder.snakeCase.encode(blocks)
+
+        #expect(String(decoding: data, as: UTF8.self).contains(#""media_type":"image/png""#))
+        let decoded = try JSONDecoder.snakeCase.decode([AnthropicResponse.ContentBlock].self, from: data)
+        guard case let .image(image) = decoded.first else {
+            Issue.record("The image did not decode.")
+            return
+        }
+        #expect(image.source.mediaType == "image/png")
+        #expect(image.source.data == "aGk=")
+    }
+
+    @Test
+    func `A tool definition goes out under the name the API expects`() throws {
+        let tool = AnthropicTool(name: "get_weather", description: "Weather.", inputSchema: .object([:]))
+        let wire = String(decoding: try JSONEncoder.snakeCase.encode(tool), as: UTF8.self)
+
+        #expect(wire.contains(#""input_schema""#))
+    }
+
+    @Test
+    func `A response decodes its usage and stop reason`() throws {
+        let body = #"""
+        {"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5",
+         "content":[{"type":"text","text":"Yes."}],
+         "stop_reason":"max_tokens","stop_sequence":null,
+         "usage":{"input_tokens":14,"cache_creation_input_tokens":0,"cache_read_input_tokens":15234,"output_tokens":8192}}
+        """#
+        let response = try JSONDecoder.snakeCase.decode(AnthropicResponse.self, from: Data(body.utf8))
+
+        #expect(response.stopReason == "max_tokens")
+        #expect(response.usage?.cacheReadInputTokens == 15234)
+        #expect(response.usage?.outputTokens == 8192)
+    }
+
     // MARK: Private
 
     /// The indices of the blocks that came out carrying a `cache_control`, read back off
