@@ -40,7 +40,8 @@ public struct AnthropicOAuthLanguageModel: Sendable {
         maxTokens: Int = 4096,
         longCacheRetention: Bool = false,
         extraBetas: [String] = [],
-        extraHeaders: [String: String] = [:]
+        extraHeaders: [String: String] = [:],
+        onEvent: (@Sendable (GenerationEvent) -> Void)? = nil
     ) {
         self.tokenProvider = tokenProvider
         self.model = model
@@ -49,6 +50,7 @@ public struct AnthropicOAuthLanguageModel: Sendable {
         self.longCacheRetention = longCacheRetention
         self.extraBetas = extraBetas
         self.extraHeaders = extraHeaders
+        self.onEvent = onEvent
     }
 
     // MARK: Public
@@ -73,6 +75,14 @@ public struct AnthropicOAuthLanguageModel: Sendable {
     /// ``reservedBodyKeys`` protects the body: they are what the API honours a
     /// subscription token for, and overriding them only produces a 401.
     public let extraHeaders: [String: String]
+
+    /// Called with everything a turn produces besides the answer text: the model's
+    /// reasoning as it is written, and a ``TurnReport`` once per request.
+    ///
+    /// Fires on the streaming and the non-streaming path alike, and once per round trip
+    /// of a tool-using exchange. Called from whichever task is draining the response, so
+    /// the closure should be cheap and must not assume a particular actor.
+    public let onEvent: (@Sendable (GenerationEvent) -> Void)?
 
     // MARK: Internal
 
@@ -217,7 +227,9 @@ public struct AnthropicOAuthLanguageModel: Sendable {
                 }
 
                 do {
-                    return try JSONDecoder.snakeCase.decode(AnthropicResponse.self, from: data)
+                    let payload = try JSONDecoder.snakeCase.decode(AnthropicResponse.self, from: data)
+                    self.report(payload)
+                    return payload
                 } catch {
                     throw AnthropicOAuthLanguageModelError.invalidResponse
                 }
@@ -227,11 +239,9 @@ public struct AnthropicOAuthLanguageModel: Sendable {
         }
     }
 
-    /// The answer as it is written, one text delta at a time.
-    ///
-    /// Text only: a stream carrying tool calls has to reassemble each call from its
-    /// `input_json_delta` fragments before anything can be run, which is the
-    /// non-streaming path's job. Callers with tools in play use ``send(messages:instructions:tools:parameters:)``.
+    /// The turn as it is written: text and thinking a fragment at a time, each tool call
+    /// once its arguments are whole, and a terminal part carrying the assistant message
+    /// to replay and what the turn cost.
     ///
     /// Not retried. A retry would replay an answer the caller has already been given
     /// half of; a stream that fails mid-flight is the caller's to restart.
@@ -239,7 +249,7 @@ public struct AnthropicOAuthLanguageModel: Sendable {
         messages: [AnthropicRequest.Message],
         instructions: String?,
         parameters: AnthropicRequestParameters
-    ) async throws -> AsyncThrowingStream<String, any Error> {
+    ) async throws -> AsyncThrowingStream<AnthropicStreamPart, any Error> {
         let request = try await makeRequest(
             streaming: true,
             messages: messages,
@@ -252,13 +262,20 @@ public struct AnthropicOAuthLanguageModel: Sendable {
         // the caller should see it thrown rather than delivered as an empty stream.
         try await Self.checkStreamResponse(response, bytes: bytes)
 
+        let onEvent = onEvent
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    var parser = AnthropicStreamParser()
                     for try await line in bytes.lines {
-                        if let delta = try Self.textDelta(in: line) {
-                            continuation.yield(delta)
+                        for part in try parser.consume(line: line) {
+                            Self.announce(part, to: onEvent)
+                            continuation.yield(part)
                         }
+                    }
+                    for part in parser.finish() {
+                        Self.announce(part, to: onEvent)
+                        continuation.yield(part)
                     }
                     continuation.finish()
                 } catch {
@@ -267,6 +284,33 @@ public struct AnthropicOAuthLanguageModel: Sendable {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    private static func announce(
+        _ part: AnthropicStreamPart,
+        to onEvent: (@Sendable (GenerationEvent) -> Void)?
+    ) {
+        guard let onEvent else { return }
+        switch part {
+        case let .thinking(delta): onEvent(.reasoning(delta))
+        case let .finished(_, report): onEvent(.turnFinished(report))
+        case .text, .toolUse: break
+        }
+    }
+
+    private func report(_ payload: AnthropicResponse) {
+        guard let onEvent else { return }
+        for case let .thinking(thinking) in payload.content where !thinking.thinking.isEmpty {
+            onEvent(.reasoning(thinking.thinking))
+        }
+        onEvent(
+            .turnFinished(
+                TurnReport(
+                    usage: payload.usage.map(TokenUsage.init(anthropic:)) ?? .init(),
+                    stopReason: payload.stopReason.map(StopReason.init(anthropic:))
+                )
+            )
+        )
     }
 
     /// The refusal arrives as the body of a non-2xx, which has to be read off the
@@ -286,47 +330,6 @@ public struct AnthropicOAuthLanguageModel: Sendable {
         }
         throw AnthropicOAuthLanguageModelError.requestFailed(statusCode: http.statusCode, message: message)
     }
-
-    /// The text an event carries, or nothing for the events that carry none — pings,
-    /// block boundaries, the usage totals at the end.
-    static func textDelta(in line: String) throws -> String? {
-        guard line.hasPrefix("data:") else { return nil }
-        let json = line.dropFirst("data:".count).trimmingCharacters(in: .whitespaces)
-        guard let event = try? JSONDecoder.snakeCase.decode(AnthropicStreamEvent.self, from: Data(json.utf8)) else {
-            return nil
-        }
-        switch event.type {
-        case "content_block_delta":
-            guard event.delta?.type == "text_delta" else { return nil }
-            return event.delta?.text
-        case "error":
-            // Mid-stream failures arrive as an event, with a 200 already on the wire.
-            throw AnthropicOAuthLanguageModelError.requestFailed(
-                statusCode: 200,
-                message: event.error?.message ?? "Anthropic ended the stream with an error."
-            )
-        default:
-            return nil
-        }
-    }
-}
-
-// MARK: - AnthropicStreamEvent
-
-struct AnthropicStreamEvent: Decodable {
-    struct Delta: Decodable {
-        let type: String?
-        let text: String?
-    }
-
-    struct StreamError: Decodable {
-        let type: String?
-        let message: String?
-    }
-
-    let type: String
-    var delta: Delta?
-    var error: StreamError?
 }
 
 // MARK: - AnthropicRequestParameters
@@ -347,7 +350,7 @@ struct AnthropicRequestParameters {
 // MARK: - AnthropicRequest
 
 struct AnthropicRequest: Encodable {
-    struct CacheControl: Codable, Equatable {
+    struct CacheControl: Codable, Equatable, Sendable {
         static let ephemeral = CacheControl(type: "ephemeral")
         static let ephemeralLong = CacheControl(type: "ephemeral", ttl: "1h")
 
@@ -473,8 +476,8 @@ struct AnthropicTool: Codable {
 
 // MARK: - AnthropicResponse
 
-struct AnthropicResponse: Decodable {
-    enum ContentBlock: Decodable, Encodable {
+struct AnthropicResponse: Decodable, Sendable {
+    enum ContentBlock: Decodable, Encodable, Sendable {
         case text(Text)
         case image(Image)
         case toolUse(ToolUse)
@@ -525,7 +528,7 @@ struct AnthropicResponse: Decodable {
         }
     }
 
-    struct Thinking: Codable {
+    struct Thinking: Codable, Sendable {
         // MARK: Lifecycle
 
         init(thinking: String, signature: String?) {
@@ -541,7 +544,7 @@ struct AnthropicResponse: Decodable {
         let signature: String?
     }
 
-    struct RedactedThinking: Codable {
+    struct RedactedThinking: Codable, Sendable {
         // MARK: Lifecycle
 
         init(data: String) {
@@ -555,7 +558,7 @@ struct AnthropicResponse: Decodable {
         let data: String
     }
 
-    struct Text: Codable {
+    struct Text: Codable, Sendable {
         // MARK: Lifecycle
 
         init(text: String, cacheControl: AnthropicRequest.CacheControl? = nil) {
@@ -571,7 +574,7 @@ struct AnthropicResponse: Decodable {
         var cacheControl: AnthropicRequest.CacheControl?
     }
 
-    struct Image: Codable {
+    struct Image: Codable, Sendable {
         // MARK: Lifecycle
 
         init(base64Data: String, mimeType: String) {
@@ -586,7 +589,7 @@ struct AnthropicResponse: Decodable {
 
         // MARK: Internal
 
-        struct Source: Codable {
+        struct Source: Codable, Sendable {
             enum CodingKeys: String, CodingKey {
                 case type
                 case mediaType = "media_type"
@@ -605,7 +608,7 @@ struct AnthropicResponse: Decodable {
         var cacheControl: AnthropicRequest.CacheControl?
     }
 
-    struct ToolUse: Codable {
+    struct ToolUse: Codable, Sendable {
         // MARK: Lifecycle
 
         init(id: String, name: String, input: [String: JSONValue]?) {
@@ -624,7 +627,7 @@ struct AnthropicResponse: Decodable {
         var cacheControl: AnthropicRequest.CacheControl?
     }
 
-    struct ToolResult: Codable {
+    struct ToolResult: Codable, Sendable {
         // MARK: Lifecycle
 
         init(toolUseID: String, content: [ContentBlock]) {
@@ -649,6 +652,8 @@ struct AnthropicResponse: Decodable {
     }
 
     let content: [ContentBlock]
+    var usage: AnthropicUsage?
+    var stopReason: String?
 }
 
 // MARK: - JSONValue tool helpers

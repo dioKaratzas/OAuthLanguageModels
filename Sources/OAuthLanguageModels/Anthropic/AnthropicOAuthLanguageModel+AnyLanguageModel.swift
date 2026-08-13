@@ -32,12 +32,7 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
 
             let toolCalls = payload.content.compactMap { block -> ProviderToolCall? in
                 guard case let .toolUse(use) = block else { return nil }
-                return try? ProviderToolCall(
-                    id: use.id,
-                    itemID: use.id,
-                    name: use.name,
-                    arguments: GeneratedContent(json: use.argumentsJSONString)
-                )
+                return Self.providerCall(for: use)
             }
 
             if !toolCalls.isEmpty {
@@ -116,12 +111,15 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
                 do {
                     let custom = options[custom: Self.self] ?? .init()
                     var text = ""
-                    let deltas = try await sendStream(
+                    let parts = try await sendStream(
                         messages: try Self.buildMessages(from: session.transcript),
                         instructions: session.instructions?.description,
                         parameters: parameters(options: options, custom: custom)
                     )
-                    for try await delta in deltas {
+                    for try await part in parts {
+                        // Reasoning and the terminal report reach the caller through the
+                        // model's `onEvent`; only the answer belongs in a snapshot.
+                        guard case let .text(delta) = part else { continue }
                         text += delta
                         // Snapshots are cumulative: each one is the answer so far, not
                         // the piece that just landed.
@@ -254,6 +252,11 @@ extension AnthropicOAuthLanguageModel: AnyLanguageModel.LanguageModel {
                 }
             }
         }
+    }
+
+    private static func providerCall(for use: AnthropicResponse.ToolUse) -> ProviderToolCall? {
+        guard let arguments = try? GeneratedContent(json: use.argumentsJSONString) else { return nil }
+        return ProviderToolCall(id: use.id, itemID: use.id, name: use.name, arguments: arguments)
     }
 
     private static func convertTool(_ tool: any Tool) throws -> AnthropicTool {

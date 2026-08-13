@@ -31,13 +31,15 @@ public struct CodexLanguageModel: Sendable {
         model: String,
         baseURL: URL = defaultCodexResponsesBaseURL,
         sessionID: String = UUID().uuidString.lowercased(),
-        originator: String = "OAuthLanguageModels"
+        originator: String = "OAuthLanguageModels",
+        onEvent: (@Sendable (GenerationEvent) -> Void)? = nil
     ) {
         self.tokenProvider = tokenProvider
         self.model = model
         self.baseURL = baseURL
         self.sessionID = sessionID
         self.originator = originator
+        self.onEvent = onEvent
         state = CodexSessionState()
     }
 
@@ -51,6 +53,14 @@ public struct CodexLanguageModel: Sendable {
     /// and audited server-side.
     public let originator: String
 
+    /// Called with everything a turn produces besides the answer text: the model's
+    /// reasoning as it is written, and a ``TurnReport`` once per request.
+    ///
+    /// Fires on the streaming and the non-streaming path alike, and once per round trip
+    /// of a tool-using exchange. Called from whichever task is draining the response, so
+    /// the closure should be cheap and must not assume a particular actor.
+    public let onEvent: (@Sendable (GenerationEvent) -> Void)?
+
     // MARK: Internal
 
     /// Top-level request keys callers may not override via `extraBody`.
@@ -63,25 +73,46 @@ public struct CodexLanguageModel: Sendable {
     /// their original item identifiers across turns in a session.
     let state: CodexSessionState
 
-    /// Streams a request's text deltas as they arrive, for a plain-text turn with no
-    /// tools to reassemble. Each element is the piece that just landed, not the answer
-    /// so far.
+    /// The turn as it is written: text and reasoning a fragment at a time, each function
+    /// call once its arguments are whole, and a terminal part carrying what the turn cost
+    /// and why it stopped.
+    ///
+    /// Not retried. A retry would replay an answer the caller has already been given half
+    /// of; a stream that fails mid-flight is the caller's to restart.
     func sendStream(
         inputs: [CodexInputItem],
         instructions: String?,
         tools: [OpenResponsesTool]?,
         parameters: CodexRequestParameters
-    ) -> AsyncThrowingStream<String, any Error> {
-        AsyncThrowingStream { continuation in
+    ) async throws -> AsyncThrowingStream<CodexStreamPart, any Error> {
+        let bytes: URLSession.AsyncBytes
+        do {
+            bytes = try await openStream(
+                inputs: inputs,
+                instructions: instructions,
+                tools: tools,
+                parameters: parameters
+            )
+        } catch let retryable as RetryableServerError {
+            throw CodexLanguageModelError.requestFailed(statusCode: retryable.statusCode, message: retryable.message)
+        }
+
+        let onEvent = onEvent
+        return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    _ = try await send(
-                        inputs: inputs,
-                        instructions: instructions,
-                        tools: tools,
-                        parameters: parameters,
-                        onDelta: { continuation.yield($0) }
-                    )
+                    var parser = CodexStreamParser()
+                    for try await line in bytes.lines {
+                        guard let payload = Self.payload(in: line) else { continue }
+                        for part in try parser.consume(payload: payload) {
+                            Self.announce(part, to: onEvent)
+                            continuation.yield(part)
+                        }
+                    }
+                    for part in parser.finish() {
+                        Self.announce(part, to: onEvent)
+                        continuation.yield(part)
+                    }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -91,58 +122,37 @@ public struct CodexLanguageModel: Sendable {
         }
     }
 
+    /// The whole turn, once it is whole. Retried on transient failures, which is safe
+    /// only because nothing has been shown to the caller yet.
     func send(
         inputs: [CodexInputItem],
         instructions: String?,
         tools: [OpenResponsesTool]?,
-        parameters: CodexRequestParameters,
-        onDelta: (@Sendable (String) -> Void)? = nil
+        parameters: CodexRequestParameters
     ) async throws -> CodexStreamingResponse {
-        let token = try await tokenProvider()
-        let url = resolveCodexURL(from: baseURL)
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.timeoutInterval = defaultLLMRequestTimeout
-        request.setValue("Bearer \(token.accessToken)", forHTTPHeaderField: "Authorization")
-        request.setValue(token.accountID, forHTTPHeaderField: "chatgpt-account-id")
-        request.setValue(originator, forHTTPHeaderField: "originator")
-        request.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
-        request.setValue("text/event-stream", forHTTPHeaderField: "accept")
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.setValue(sessionID, forHTTPHeaderField: "session_id")
-        request.setValue(sessionID, forHTTPHeaderField: "x-client-request-id")
-        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
-
-        let requestBody = try JSONEncoder.deterministic.encode(
-            Self.makeRequestBody(
-                model: model,
-                instructions: resolvedInstructions(instructions),
-                inputs: inputs.map(\.json),
-                tools: tools,
-                promptCacheKey: sessionID,
-                parameters: parameters
-            )
-        )
-        request.httpBody = requestBody
-
         do {
             return try await withNetworkRetry {
-                let (bytes, response) = try await URLSession.shared.bytes(for: request)
-                guard let httpResponse = response as? HTTPURLResponse else {
-                    throw CodexLanguageModelError.invalidResponse
-                }
-
-                guard (200..<300).contains(httpResponse.statusCode) else {
-                    let data = try await collect(bytes)
-                    let message = String(decoding: data, as: UTF8.self)
-                    if isRetryableHTTPStatus(httpResponse.statusCode) {
-                        throw RetryableServerError(statusCode: httpResponse.statusCode, message: message)
+                let bytes = try await openStream(
+                    inputs: inputs,
+                    instructions: instructions,
+                    tools: tools,
+                    parameters: parameters
+                )
+                var parser = CodexStreamParser()
+                var response: CodexStreamingResponse?
+                for try await line in bytes.lines {
+                    guard let payload = Self.payload(in: line) else { continue }
+                    for part in try parser.consume(payload: payload) {
+                        Self.announce(part, to: onEvent)
+                        if case let .finished(finished) = part { response = finished }
                     }
-                    throw CodexLanguageModelError.requestFailed(statusCode: httpResponse.statusCode, message: message)
                 }
-
-                return try await parseSSE(bytes: bytes, onDelta: onDelta)
+                for part in parser.finish() {
+                    Self.announce(part, to: onEvent)
+                    if case let .finished(finished) = part { response = finished }
+                }
+                guard let response else { throw CodexLanguageModelError.invalidResponse }
+                return response
             }
         } catch let retryable as RetryableServerError {
             throw CodexLanguageModelError.requestFailed(statusCode: retryable.statusCode, message: retryable.message)
@@ -228,151 +238,6 @@ public struct CodexLanguageModel: Sendable {
         return "OAuthLanguageModels (\(osName) \(version.majorVersion).\(version.minorVersion).\(version.patchVersion))"
     }
 
-    // MARK: SSE parsing helpers
-
-    static func processEvent(
-        _ payload: String,
-        accumulatedText: inout String,
-        latestOutput: inout [JSONValue]?,
-        latestOutputText: inout String?,
-        toolCallsByID: inout [String: CodexToolCall],
-        onDelta: (@Sendable (String) -> Void)? = nil
-    ) throws {
-        guard payload != "[DONE]", !payload.isEmpty else { return }
-        guard let data = payload.data(using: .utf8) else { return }
-
-        let value: JSONValue
-        do {
-            value = try JSONDecoder().decode(JSONValue.self, from: data)
-        } catch {
-            return
-        }
-
-        if case let .object(object) = value {
-            if let type = object["type"].flatMap({ if case let .string(string) = $0 { string } else { nil } }),
-               type == "response.output_text.delta",
-               let delta = object["delta"].flatMap({ if case let .string(string) = $0 { string } else { nil } }) {
-                accumulatedText += delta
-                onDelta?(delta)
-            }
-
-            if let outputText = object["output_text"].flatMap({ if case let .string(string) = $0 { string } else { nil } }) {
-                latestOutputText = outputText
-            }
-
-            if let response = object["response"], case let .object(responseObject) = response {
-                if case let .array(output)? = responseObject["output"] {
-                    latestOutput = output
-                }
-                if let outputText = responseObject["output_text"].flatMap({ if case let .string(string) = $0 { string } else { nil } }) {
-                    latestOutputText = outputText
-                }
-            } else if case let .array(output)? = object["output"] {
-                latestOutput = output
-            }
-        }
-
-        var collected: [CodexToolCall] = []
-        collectToolCalls(from: value, into: &collected)
-        for call in collected {
-            toolCallsByID[call.id] = call
-        }
-    }
-
-    private static func collectToolCalls(from value: JSONValue, into result: inout [CodexToolCall]) {
-        switch value {
-        case let .object(object):
-            let type = object["type"].flatMap {
-                if case let .string(string) = $0 { string } else { nil }
-            }
-            if let type, ["function_call", "tool_call", "tool_use"].contains(type),
-               let call = parseToolCall(from: object) {
-                result.append(call)
-            }
-            if let item = object["item"] {
-                collectToolCalls(from: item, into: &result)
-            }
-            if let toolCall = object["tool_call"] {
-                collectToolCalls(from: toolCall, into: &result)
-            }
-            if let content = object["content"] {
-                collectToolCalls(from: content, into: &result)
-            }
-            for (key, value) in object where key != "content" && key != "item" && key != "tool_call" {
-                collectToolCalls(from: value, into: &result)
-            }
-        case let .array(array):
-            for item in array {
-                collectToolCalls(from: item, into: &result)
-            }
-        default:
-            break
-        }
-    }
-
-    private static func parseToolCall(from object: [String: JSONValue]) -> CodexToolCall? {
-        let itemID = object["id"].flatMap {
-            if case let .string(string) = $0 { string } else { nil }
-        }
-        let callID = object["call_id"].flatMap {
-            if case let .string(string) = $0 { string } else { nil }
-        } ?? itemID
-        let name = object["name"].flatMap {
-            if case let .string(string) = $0 { string } else { nil }
-        }
-        guard let callID, let name, !callID.isEmpty, !name.isEmpty else { return nil }
-
-        let argumentsJSON: String = if let arguments = object["arguments"] {
-            switch arguments {
-            case let .string(string):
-                string
-            case let .object(object):
-                (try? jsonObjectString(from: object)) ?? "{}"
-            default:
-                "{}"
-            }
-        } else {
-            "{}"
-        }
-
-        return CodexToolCall(id: callID, itemID: itemID, name: name, argumentsJSON: argumentsJSON)
-    }
-
-    private static func extractText(from output: [JSONValue]?) -> String? {
-        guard let output else { return nil }
-        var parts: [String] = []
-        for item in output {
-            guard case let .object(object) = item,
-                  object["type"].flatMap({ if case let .string(string) = $0 { string } else { nil } }) == "message",
-                  case let .array(content)? = object["content"] else {
-                continue
-            }
-            for block in content {
-                guard case let .object(object) = block,
-                      object["type"].flatMap({ if case let .string(string) = $0 { string } else { nil } }) == "output_text",
-                      case let .string(text)? = object["text"] else {
-                    continue
-                }
-                parts.append(text)
-            }
-        }
-        return parts.isEmpty ? nil : parts.joined()
-    }
-
-    /// Pull `reasoning` items out of the final response output array, in
-    /// their original order, to replay across turns when `store: false`.
-    private static func extractReasoningItems(from output: [JSONValue]?) -> [JSONValue] {
-        guard let output else { return [] }
-        return output.compactMap { item in
-            guard case let .object(object) = item,
-                  case let .string(type)? = object["type"],
-                  type == "reasoning" else {
-                return nil
-            }
-            return item
-        }
-    }
-
     private func resolvedInstructions(_ instructions: String?) -> String {
         guard let instructions, !instructions.isEmpty else {
             return "You are a helpful assistant."
@@ -391,47 +256,81 @@ public struct CodexLanguageModel: Sendable {
         return URL(string: trimmed + "/codex/responses")!
     }
 
-    private func parseSSE(
-        bytes: URLSession.AsyncBytes,
-        onDelta: (@Sendable (String) -> Void)? = nil
-    ) async throws -> CodexStreamingResponse {
-        var accumulatedText = ""
-        var latestOutput: [JSONValue]?
-        var latestOutputText: String?
-        var toolCallsByID: [String: CodexToolCall] = [:]
+    /// Sends the request and hands back the response body, having already turned a
+    /// non-2xx into the error its body describes. Retryable statuses come back as
+    /// ``RetryableServerError`` so the non-streaming path can act on them.
+    private func openStream(
+        inputs: [CodexInputItem],
+        instructions: String?,
+        tools: [OpenResponsesTool]?,
+        parameters: CodexRequestParameters
+    ) async throws -> URLSession.AsyncBytes {
+        let token = try await tokenProvider()
 
-        for try await line in bytes.lines {
-            guard line.hasPrefix("data:") else { continue }
-            let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-            try Self.processEvent(
-                payload,
-                accumulatedText: &accumulatedText,
-                latestOutput: &latestOutput,
-                latestOutputText: &latestOutputText,
-                toolCallsByID: &toolCallsByID,
-                onDelta: onDelta
+        var request = URLRequest(url: resolveCodexURL(from: baseURL))
+        request.httpMethod = "POST"
+        request.timeoutInterval = defaultLLMRequestTimeout
+        request.setValue("Bearer \(token.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(token.accountID, forHTTPHeaderField: "chatgpt-account-id")
+        request.setValue(originator, forHTTPHeaderField: "originator")
+        request.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
+        request.setValue("text/event-stream", forHTTPHeaderField: "accept")
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.setValue(sessionID, forHTTPHeaderField: "session_id")
+        request.setValue(sessionID, forHTTPHeaderField: "x-client-request-id")
+        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+        request.httpBody = try JSONEncoder.deterministic.encode(
+            Self.makeRequestBody(
+                model: model,
+                instructions: resolvedInstructions(instructions),
+                inputs: inputs.map(\.json),
+                tools: tools,
+                promptCacheKey: sessionID,
+                parameters: parameters
             )
-        }
-
-        let toolCalls = Array(toolCallsByID.values).sorted { $0.id < $1.id }
-        let outputText = accumulatedText.isEmpty ? latestOutputText : accumulatedText
-        let text = outputText ?? Self.extractText(from: latestOutput)
-        let reasoningItems = Self.extractReasoningItems(from: latestOutput).map { CodexInputItem(json: $0) }
-        return CodexStreamingResponse(
-            text: text,
-            hasOutput: latestOutput != nil,
-            toolCalls: toolCalls,
-            reasoningItems: reasoningItems
         )
+
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw CodexLanguageModelError.invalidResponse
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            let message = String(decoding: try await Self.collect(bytes), as: UTF8.self)
+            if isRetryableHTTPStatus(httpResponse.statusCode) {
+                throw RetryableServerError(statusCode: httpResponse.statusCode, message: message)
+            }
+            throw CodexLanguageModelError.requestFailed(statusCode: httpResponse.statusCode, message: message)
+        }
+        return bytes
     }
 
-    private func collect(_ bytes: URLSession.AsyncBytes) async throws -> Data {
+    /// The JSON an SSE line carries, or nothing for the `event:` names and the blank
+    /// separators between events.
+    private static func payload(in line: String) -> String? {
+        guard line.hasPrefix("data:") else { return nil }
+        return String(line.dropFirst("data:".count)).trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func announce(
+        _ part: CodexStreamPart,
+        to onEvent: (@Sendable (GenerationEvent) -> Void)?
+    ) {
+        guard let onEvent else { return }
+        switch part {
+        case let .reasoning(delta): onEvent(.reasoning(delta))
+        case let .finished(response): onEvent(.turnFinished(response.report))
+        case .text, .toolCall: break
+        }
+    }
+
+    private static func collect(_ bytes: URLSession.AsyncBytes) async throws -> Data {
         var data = Data()
         for try await byte in bytes {
             data.append(byte)
         }
         return data
     }
+
 }
 
 // MARK: - CodexRequestParameters
@@ -573,7 +472,7 @@ func makeOpenResponsesTool(name: String, description: String, schema: some Encod
 
 // MARK: - CodexStreamingResponse
 
-struct CodexStreamingResponse {
+struct CodexStreamingResponse: Sendable {
     /// Final assistant text (accumulated deltas or extracted output).
     let text: String?
     /// Whether the response carried an `output` array at all.
@@ -581,6 +480,7 @@ struct CodexStreamingResponse {
     let toolCalls: [CodexToolCall]
     /// Encrypted `reasoning` items to replay in subsequent requests.
     let reasoningItems: [CodexInputItem]
+    let report: TurnReport
 }
 
 // MARK: - CodexLanguageModelError

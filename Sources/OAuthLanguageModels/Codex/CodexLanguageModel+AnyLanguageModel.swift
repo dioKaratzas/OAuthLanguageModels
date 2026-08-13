@@ -110,13 +110,16 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
                     let custom = options[custom: Self.self] ?? .init()
                     let inputs = try await buildInputs(from: session.transcript)
                     var text = ""
-                    let deltas = sendStream(
+                    let parts = try await sendStream(
                         inputs: inputs,
                         instructions: session.instructions?.description,
                         tools: nil,
                         parameters: parameters(options: options, custom: custom)
                     )
-                    for try await delta in deltas {
+                    for try await part in parts {
+                        // Reasoning and the terminal report reach the caller through the
+                        // model's `onEvent`; only the answer belongs in a snapshot.
+                        guard case let .text(delta) = part else { continue }
                         text += delta
                         // Snapshots are cumulative: each one is the answer so far, not the
                         // piece that just landed.
