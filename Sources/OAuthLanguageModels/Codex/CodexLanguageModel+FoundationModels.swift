@@ -38,7 +38,9 @@ import FoundationModels
                 makeOpenResponsesTool(name: $0.name, description: $0.description, schema: $0.parameters)
             }
 
-            let response = try await model.send(
+            // One turn, streamed: the framework runs the tools itself and calls back with
+            // a transcript that already carries their output, so there is no loop here.
+            let parts = try await model.sendStream(
                 inputs: Self.buildInputs(from: request.transcript),
                 instructions: Self.instructions(from: request.transcript),
                 tools: tools.isEmpty ? nil : tools,
@@ -48,21 +50,31 @@ import FoundationModels
                 )
             )
 
-            for call in response.toolCalls {
-                await channel.send(
-                    .toolCalls(
-                        action: .toolCall(
-                            id: call.id,
-                            name: call.name,
-                            action: .appendArguments(call.argumentsJSON, tokenCount: 0)
+            var emittedAnything = false
+            for try await part in parts {
+                switch part {
+                case let .text(delta):
+                    emittedAnything = true
+                    await channel.send(.response(action: .appendText(delta, tokenCount: 0)))
+                case let .toolCall(call):
+                    emittedAnything = true
+                    await channel.send(
+                        .toolCalls(
+                            action: .toolCall(
+                                id: call.id,
+                                name: call.name,
+                                action: .appendArguments(call.argumentsJSON, tokenCount: 0)
+                            )
                         )
                     )
-                )
+                case .reasoning, .finished:
+                    // Reasoning and the turn report reach the caller through the model's
+                    // `onEvent`; the channel carries the answer only.
+                    break
+                }
             }
 
-            if let text = response.text, !text.isEmpty {
-                await channel.send(.response(action: .appendText(text, tokenCount: 0)))
-            } else if response.toolCalls.isEmpty {
+            if !emittedAnything {
                 await channel.send(.response(action: .appendText("", tokenCount: 0)))
             }
         }

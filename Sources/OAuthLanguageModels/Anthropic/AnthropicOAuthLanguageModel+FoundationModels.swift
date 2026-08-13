@@ -38,7 +38,9 @@ import FoundationModels
                 try makeAnthropicTool(name: $0.name, description: $0.description, schema: $0.parameters)
             }
 
-            let payload = try await model.send(
+            // One turn, streamed: the framework runs the tools itself and calls back with
+            // a transcript that already carries their output, so there is no loop here.
+            let parts = try await model.sendStream(
                 messages: Self.buildMessages(from: request.transcript),
                 instructions: Self.instructions(from: request.transcript),
                 tools: tools.isEmpty ? nil : tools,
@@ -49,11 +51,11 @@ import FoundationModels
             )
 
             var emittedAnything = false
-            for block in payload.content {
-                switch block {
-                case let .text(text):
+            for try await part in parts {
+                switch part {
+                case let .text(delta):
                     emittedAnything = true
-                    await channel.send(.response(action: .appendText(text.text, tokenCount: 0)))
+                    await channel.send(.response(action: .appendText(delta, tokenCount: 0)))
                 case let .toolUse(use):
                     emittedAnything = true
                     await channel.send(
@@ -65,7 +67,9 @@ import FoundationModels
                             )
                         )
                     )
-                default:
+                case .thinking, .finished:
+                    // Reasoning and the turn report reach the caller through the model's
+                    // `onEvent`; the channel carries the answer only.
                     break
                 }
             }
