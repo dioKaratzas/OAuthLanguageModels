@@ -55,6 +55,22 @@ extension JSONValue {
     var arrayValue: [JSONValue]? {
         if case let .array(array) = self { array } else { nil }
     }
+
+    /// `other` laid over this value: two objects merge key by key, all the way down, and
+    /// anything else replaces outright.
+    ///
+    /// This is what lets a caller add a single field to an object the package already
+    /// builds — an `output_config`, a `reasoning` — without restating the rest of it and
+    /// having to keep the restatement in step.
+    func merging(_ other: JSONValue) -> JSONValue {
+        guard case var .object(base) = self, case let .object(overlay) = other else {
+            return other
+        }
+        for (key, value) in overlay {
+            base[key] = base[key].map { $0.merging(value) } ?? value
+        }
+        return .object(base)
+    }
 }
 
 // MARK: - DynamicCodingKey

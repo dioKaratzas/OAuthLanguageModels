@@ -149,23 +149,7 @@ public struct CodexLanguageModel: Sendable {
         }
     }
 
-    // MARK: Private
-
-    private static var userAgent: String {
-        let processInfo = ProcessInfo.processInfo
-        let version = processInfo.operatingSystemVersion
-        let osName: String
-        #if os(macOS)
-        osName = "macOS"
-        #elseif os(Linux)
-        osName = "Linux"
-        #else
-        osName = "Unknown"
-        #endif
-        return "OAuthLanguageModels (\(osName) \(version.majorVersion).\(version.minorVersion).\(version.patchVersion))"
-    }
-
-    private static func makeRequestBody(
+    static func makeRequestBody(
         model: String,
         instructions: String,
         inputs: [JSONValue],
@@ -222,10 +206,26 @@ public struct CodexLanguageModel: Sendable {
                 logDropped("body key", name: key, from: "extraBody")
                 continue
             }
-            body[key] = value
+            body[key] = body[key].map { $0.merging(value) } ?? value
         }
 
         return .object(body)
+    }
+
+    // MARK: Private
+
+    private static var userAgent: String {
+        let processInfo = ProcessInfo.processInfo
+        let version = processInfo.operatingSystemVersion
+        let osName: String
+        #if os(macOS)
+        osName = "macOS"
+        #elseif os(Linux)
+        osName = "Linux"
+        #else
+        osName = "Unknown"
+        #endif
+        return "OAuthLanguageModels (\(osName) \(version.majorVersion).\(version.minorVersion).\(version.patchVersion))"
     }
 
     // MARK: SSE parsing helpers

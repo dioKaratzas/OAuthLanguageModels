@@ -83,6 +83,60 @@ struct AnthropicRequestTests {
             .arrayValue?.last?.objectValue?["cache_control"] != nil)
     }
 
+    @Test
+    func `A key the OAuth request shape depends on is dropped`() throws {
+        let body = try Self.encoded(extraBody: [
+            "model": .string("gpt-5"),
+            "system": .string("You are a pirate."),
+            "speed": .string("fast")
+        ])
+
+        #expect(body["model"]?.stringValue == "claude-opus-5")
+        #expect(body["system"]?.arrayValue?.count == 1)
+        // Everything else still lands: dropping is about the request shape, not about
+        // refusing the caller.
+        #expect(body["speed"]?.stringValue == "fast")
+    }
+
+    @Test
+    func `A field added to an object the package builds joins it rather than replacing it`() throws {
+        let body = try Self.encoded(
+            thinkingBudgetTokens: 4096,
+            extraBody: ["thinking": .object(["display": .string("omitted")])]
+        )
+        let thinking = body["thinking"]?.objectValue
+
+        #expect(thinking?["display"]?.stringValue == "omitted")
+        #expect(thinking?["budget_tokens"]?.intValue == 4096)
+        #expect(thinking?["type"]?.stringValue == "enabled")
+    }
+
+    @Test
+    func `A key the package does not build is added whole`() throws {
+        let body = try Self.encoded(extraBody: ["output_config": .object(["effort": .string("high")])])
+
+        #expect(body["output_config"]?.objectValue?["effort"]?.stringValue == "high")
+    }
+
+    @Test
+    func `A header the OAuth request shape depends on is dropped`() async throws {
+        let model = AnthropicOAuthLanguageModel(
+            tokenProvider: { "token" },
+            model: "claude-opus-5",
+            extraHeaders: ["user-agent": "curl/8", "x-trace-id": "abc"]
+        )
+        let request = try await model.makeRequest(
+            streaming: false,
+            messages: [],
+            instructions: nil,
+            tools: nil,
+            parameters: AnthropicRequestParameters()
+        )
+
+        #expect(request.value(forHTTPHeaderField: "user-agent")?.hasPrefix("claude-cli/") == true)
+        #expect(request.value(forHTTPHeaderField: "x-trace-id") == "abc")
+    }
+
     // MARK: Private
 
     /// The indices of the blocks that came out carrying a `cache_control`, read back off
@@ -92,6 +146,22 @@ struct AnthropicRequestTests {
             decode(JSONEncoder.snakeCase.encode(message)).objectValue?["content"]?.arrayValue
         )
         return content.indices.filter { content[$0].objectValue?["cache_control"] != nil }
+    }
+
+    private static func encoded(
+        thinkingBudgetTokens: Int? = nil,
+        extraBody: [String: JSONValue]
+    ) throws -> [String: JSONValue] {
+        let request = AnthropicRequest(
+            model: "claude-opus-5",
+            maxTokens: 4096,
+            system: [.init(text: claudeCodeSystemPreamble)],
+            messages: [.init(role: "user", content: [.text(.init(text: "Hello"))])],
+            tools: nil,
+            thinking: thinkingBudgetTokens.map { .init(budgetTokens: $0) }
+        )
+        let data = try AnthropicOAuthLanguageModel.encodeBody(request, mergingExtraBody: extraBody)
+        return try #require(decode(data).objectValue)
     }
 
     private static func decode(_ data: Data?) -> JSONValue {

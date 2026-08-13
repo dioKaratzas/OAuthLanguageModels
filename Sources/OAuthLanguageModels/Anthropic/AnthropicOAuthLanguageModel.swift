@@ -99,6 +99,10 @@ public struct AnthropicOAuthLanguageModel: Sendable {
 
     /// Encode the request body and merge any caller-supplied `extraBody`
     /// keys, dropping reserved keys to preserve the OAuth request shape.
+    ///
+    /// Object values merge into an object the package already built rather than
+    /// replacing it, so a caller can add one field to `output_config` or `thinking`
+    /// without restating the rest of it. Every other kind replaces outright.
     static func encodeBody(
         _ body: AnthropicRequest,
         mergingExtraBody extra: [String: JSONValue]?
@@ -113,7 +117,7 @@ public struct AnthropicOAuthLanguageModel: Sendable {
                 logDropped("body key", name: key, from: "extraBody")
                 continue
             }
-            object[key] = value
+            object[key] = object[key].map { $0.merging(value) } ?? value
         }
         return try JSONEncoder.deterministic.encode(JSONValue.object(object))
     }
