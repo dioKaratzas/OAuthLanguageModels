@@ -92,7 +92,7 @@ public enum AnthropicOAuthFlow {
             expectedState: state
         )
 
-        let authorizeURL = buildAuthorizationURL(challenge: pkce.challenge, state: state)
+        let authorizeURL = try buildAuthorizationURL(challenge: pkce.challenge, state: state)
         return AnthropicPendingLogin(
             authorizationURL: authorizeURL,
             server: server,
@@ -101,8 +101,10 @@ public enum AnthropicOAuthFlow {
         )
     }
 
-    public static func buildAuthorizationURL(challenge: String, state: String) -> URL {
-        var components = URLComponents(url: anthropicAuthorizeURL, resolvingAgainstBaseURL: false)!
+    public static func buildAuthorizationURL(challenge: String, state: String) throws -> URL {
+        guard var components = URLComponents(url: anthropicAuthorizeURL, resolvingAgainstBaseURL: false) else {
+            throw OAuthFlowError.authorizationURLNotBuildable
+        }
         components.queryItems = [
             URLQueryItem(name: "code", value: "true"),
             URLQueryItem(name: "client_id", value: anthropicOAuthClientID),
@@ -113,7 +115,10 @@ public enum AnthropicOAuthFlow {
             URLQueryItem(name: "code_challenge_method", value: "S256"),
             URLQueryItem(name: "state", value: state),
         ]
-        return components.url!
+        guard let url = components.url else {
+            throw OAuthFlowError.authorizationURLNotBuildable
+        }
+        return url
     }
 
     public static func exchangeAuthorizationCode(code: String, state: String, verifier: String) async throws -> AnthropicAuth {

@@ -130,7 +130,7 @@ func emptyResponseContent<Content: Generable>(
 ) throws -> (content: Content, rawContent: GeneratedContent) {
     if type == String.self {
         let raw = GeneratedContent("")
-        return ("" as! Content, raw)
+        return (try Content(raw), raw)
     }
 
     let emptyObject = GeneratedContent(properties: [:])

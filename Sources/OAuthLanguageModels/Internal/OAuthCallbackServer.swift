@@ -76,7 +76,9 @@ actor OAuthCallbackServer {
                 try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
                 throw OAuthCallbackError.timeout
             }
-            let value = try await group.next()!
+            guard let value = try await group.next() else {
+                throw OAuthCallbackError.serverError("The callback server stopped without a result.")
+            }
             group.cancelAll()
             return value
         }

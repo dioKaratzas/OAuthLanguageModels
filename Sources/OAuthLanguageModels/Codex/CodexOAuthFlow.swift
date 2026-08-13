@@ -92,7 +92,7 @@ public enum CodexOAuthFlow {
             expectedState: state
         )
 
-        let authorizeURL = buildAuthorizationURL(
+        let authorizeURL = try buildAuthorizationURL(
             challenge: pkce.challenge,
             state: state,
             originator: originator
@@ -108,8 +108,10 @@ public enum CodexOAuthFlow {
         challenge: String,
         state: String,
         originator: String = defaultCodexOriginator
-    ) -> URL {
-        var components = URLComponents(url: codexAuthorizeURL, resolvingAgainstBaseURL: false)!
+    ) throws -> URL {
+        guard var components = URLComponents(url: codexAuthorizeURL, resolvingAgainstBaseURL: false) else {
+            throw OAuthFlowError.authorizationURLNotBuildable
+        }
         components.queryItems = [
             URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "client_id", value: codexOAuthClientID),
@@ -122,7 +124,10 @@ public enum CodexOAuthFlow {
             URLQueryItem(name: "codex_cli_simplified_flow", value: "true"),
             URLQueryItem(name: "originator", value: originator),
         ]
-        return components.url!
+        guard let url = components.url else {
+            throw OAuthFlowError.authorizationURLNotBuildable
+        }
+        return url
     }
 
     public static func exchangeAuthorizationCode(code: String, verifier: String) async throws -> CodexAuth {
