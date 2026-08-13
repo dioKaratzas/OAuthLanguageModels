@@ -1,6 +1,16 @@
 import AnyLanguageModel
 import Foundation
+import Testing
 @testable import OAuthLanguageModels
+
+/// Every exchange driven against the stub, under one roof.
+///
+/// `.serialized` covers a suite and everything nested inside it, but not its siblings —
+/// and the stub is a single `URLProtocol` reached through `URLSession.shared`, so two
+/// suites running side by side would answer each other's requests. Nesting them here is
+/// what keeps them apart.
+@Suite("Streamed exchanges", .serialized)
+struct StreamedExchange {}
 
 /// The turns a stubbed provider will serve, and what it was asked for, shared between a
 /// test and the `URLProtocol` the request lands in.
@@ -55,18 +65,32 @@ final class Exchange: @unchecked Sendable {
 final class StubProtocol: URLProtocol {
     // MARK: Internal
 
+    /// Registers the stub for the rest of the process.
+    ///
+    /// Never unregistered: a test that took it away while another was mid-request would
+    /// send that request to the real endpoint.
+    static func install() {
+        guard !isInstalled else { return }
+        isInstalled = true
+        URLProtocol.registerClass(StubProtocol.self)
+    }
+
     override class func canInit(with _: URLRequest) -> Bool { true }
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
         Exchange.shared.record(Self.body(of: request))
-        let response = HTTPURLResponse(
-            url: request.url!,
-            statusCode: 200,
-            httpVersion: "HTTP/1.1",
-            headerFields: ["Content-Type": "text/event-stream"]
-        )!
+        guard let url = request.url,
+              let response = HTTPURLResponse(
+                  url: url,
+                  statusCode: 200,
+                  httpVersion: "HTTP/1.1",
+                  headerFields: ["Content-Type": "text/event-stream"]
+              ) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(Exchange.shared.next().utf8))
         client?.urlProtocolDidFinishLoading(self)
@@ -75,6 +99,8 @@ final class StubProtocol: URLProtocol {
     override func stopLoading() {}
 
     // MARK: Private
+
+    nonisolated(unsafe) private static var isInstalled = false
 
     /// `URLProtocol` hands the body over as a stream once the request has been sent.
     private static func body(of request: URLRequest) -> String {
@@ -168,8 +194,7 @@ func streamedSnapshots(
     repeatingLastTurn: Bool = false,
     delegate: (any ToolExecutionDelegate)? = nil
 ) async throws -> [String] {
-    URLProtocol.registerClass(StubProtocol.self)
-    defer { URLProtocol.unregisterClass(StubProtocol.self) }
+    StubProtocol.install()
     if repeatingLastTurn {
         Exchange.shared.serveForever(turns)
     } else {
