@@ -229,12 +229,19 @@ extension CodexLanguageModel: AnyLanguageModel.LanguageModel {
 
     /// The Responses API's `text.format`, which needs a name for the schema as well as
     /// the schema itself.
+    ///
+    /// Sent without `strict`. Strict mode demands that every property be listed as
+    /// required, and expresses an optional one as a union with null instead — where a
+    /// `Generable` type leaves its optional properties out of `required` and types them
+    /// plainly. Asking for strict against such a schema is refused outright, so a type
+    /// with one optional field could not be generated at all; without it the schema still
+    /// guides the model, and an answer that does not match is reported when it is
+    /// decoded.
     private static func responseFormat(_ schema: JSONValue, named name: String) -> JSONValue {
         .object([
             "type": .string("json_schema"),
             "name": .string(name),
-            "schema": schema,
-            "strict": .bool(true)
+            "schema": schema
         ])
     }
 

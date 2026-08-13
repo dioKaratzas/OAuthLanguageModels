@@ -170,6 +170,10 @@ struct PartialContent<Content: Generable> where Content.PartiallyGenerated: Send
     /// make a document that never parses.
     mutating func startTurn() {
         text = ""
+        // The fields belong to the document, not to the exchange: a turn that wrote half
+        // an object before breaking off to call a tool would otherwise hold the next turn
+        // silent until it had written past the same fields again.
+        arrived = []
     }
 
     // MARK: Private

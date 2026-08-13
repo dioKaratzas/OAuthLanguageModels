@@ -13,6 +13,15 @@ struct Forecast: Equatable {
     var degrees: Int
 }
 
+/// A type with an optional property, which is what strict mode cannot express.
+@Generable
+struct Sighting: Equatable {
+    @Guide(description: "Where.")
+    var place: String
+    @Guide(description: "Anything else worth saying.")
+    var note: String?
+}
+
 /// Both providers writing a structured answer, against a stubbed endpoint.
 ///
 /// Serialized for the same reason as the tool suite: the stub is reached through
@@ -233,7 +242,9 @@ extension StreamedExchange {
             let body = try #require(Exchange.shared.requestBodies.first)
 
             #expect(body.contains(#""format":{"name":"Forecast""#))
-            #expect(body.contains(#""strict":true"#))
+            // No `strict`: it demands every property be required, which a type with an
+            // optional field can never satisfy.
+            #expect(!body.contains("strict"))
             #expect(body.contains(#""place""#))
         }
 
@@ -303,6 +314,29 @@ extension StreamedExchange {
                     generating: Forecast.self
                 )
             }
+        }
+
+        @Test
+        func `An optional property stays optional in the schema that goes out`() throws {
+            let produced = try structuredSchema(for: Sighting.self)
+            let schema = try #require(produced)
+            let names = schema.objectValue?["required"]?.arrayValue?.compactMap(\.stringValue)
+            let required = try #require(names)
+
+            // Strict mode would demand `note` here and refuse the request without it, so
+            // a type with one optional property could not be generated at all.
+            #expect(required == ["place"])
+        }
+
+        @Test
+        func `A new turn is read on its own, not against the one before it`() {
+            var partial = PartialContent<Forecast>()
+            _ = partial.append(#"{"place": "Athens", "degrees": 17}"#)
+            partial.startTurn()
+
+            // The fields belong to the document. A turn that wrote half an object before
+            // breaking off to call a tool must not hold the next turn silent.
+            #expect(partial.append(#"{"place": "Rome"}"#) != nil)
         }
 
         @Test
